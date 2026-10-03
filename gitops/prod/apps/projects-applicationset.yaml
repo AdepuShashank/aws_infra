@@ -44,11 +44,7 @@ spec:
     spec:
       project: default
       source:
-        # TODO: replace with the real repository before the first sync. Argo CD
-        # reports the failure as an Application stuck with an Unknown sync status
-        # and a "repository not found" condition - visible, but only after
-        # someone is watching the ApplicationSet.
-        repoURL: https://github.com/REPLACE_ME/dpx-infra
+        repoURL: https://github.com/AdepuShashank/aws_infra
         targetRevision: main
         # The same scaffold chart for every project. The destination namespace is
         # what differs, and the chart templates off .Release.Namespace - so there

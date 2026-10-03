@@ -26,7 +26,7 @@ argocd_chart_version = "10.9.6"
 # script creates the root Application pointing here, so a wrong value produces an
 # Application stuck OutOfSync against a repository that does not exist - visible,
 # but only after the association has run.
-gitops_repo_url        = "REPLACE_ME/dpx-infra"
+gitops_repo_url        = "AdepuShashank/aws_infra"
 gitops_repo_path       = "gitops/qa"
 gitops_target_revision = "main"
 gitops_ssh_host        = "github.com"
