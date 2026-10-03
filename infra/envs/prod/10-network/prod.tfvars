@@ -3,7 +3,7 @@
 # Applied with:
 #   terraform plan -input=false -var-file=..\common.tfvars -var-file=prod.tfvars
 
-compute_enabled = true
+compute_enabled = false
 
 # 10.10.0.0/16 must not overlap the pod CIDR (10.200.0.0/16) or the service
 # CIDR (10.96.0.0/12). The module asserts this at plan time.

@@ -4,6 +4,70 @@ Where the build actually is, as of **2026-10-03**. Phases 0-6 are applied in
 prod; 7 and 8 are written but not synced. Two things block the rest, both listed
 at the bottom.
 
+## PAUSED FOR COST - resume here first
+
+Compute is stopped. `compute_enabled = false` in
+`infra/envs/prod/10-network/prod.tfvars` and `infra/envs/prod/30-cluster/prod.tfvars`,
+both layers applied:
+
+| Resource | State after pause |
+|---|---|
+| prod NAT (`i-040fbed3491c1a19c`) | **stopped in place** |
+| prod control plane (`i-0b7d611942ed0a2c3`) | **stopped in place** |
+| prod worker ASG | **scaled to 0**, worker instances terminated |
+| qa NAT (`i-096700562d53aab75`) | already stopped |
+
+Nothing was destroyed. The control plane's root volume survives, so etcd - and
+therefore all cluster state - comes back with it. The worker ASG will launch a
+fresh worker, which joins from the SSM-published token like any new node.
+
+### To resume
+
+```powershell
+# 1. flip the flag back in both layers
+#    infra\envs\prod\10-network\prod.tfvars  ->  compute_enabled = true
+#    infra\envs\prod\30-cluster\prod.tfvars  ->  compute_enabled = true
+
+Push-Location infra\envs\prod\10-network
+terraform apply -input=false -auto-approve "-var-file=..\common.tfvars" "-var-file=prod.tfvars"
+Pop-Location
+
+Push-Location infra\envs\prod\30-cluster
+terraform apply -input=false -auto-approve "-var-file=..\common.tfvars" "-var-file=prod.tfvars"
+Pop-Location
+```
+
+The control plane takes roughly 2 minutes to finish `kubeadm init` on boot and the
+worker about 4 to 5 to join. Check with:
+
+```
+kubectl get nodes          # both Ready
+```
+
+The platform bootstrap association re-fires within 30 minutes and is idempotent,
+so no manual re-run is needed unless something looks wrong - then run the document
+by hand:
+
+```powershell
+aws ssm send-command --region ap-south-1 `
+  --instance-ids <control-plane-id> `
+  --document-name dpx-prod-platform-bootstrap-doc
+```
+
+### What still bills while paused
+
+The instances and the worker are the expensive part and all of it is gone. What
+remains is small but not zero:
+
+| Item | Approx. | Note |
+|---|---|---|
+| EBS gp3 root volumes (3 x 30 GB) | ~USD 2.40 / month | `delete_on_termination` only fires on termination, not on stop |
+| ALB | ~USD 0.02 / hour | left running on purpose - destroying it loses the target group wiring |
+| S3 buckets, KMS keys, state | negligible | empty, or a few KB |
+
+Deleting the ALB and the volumes would save roughly USD 3 a month, which is not
+worth losing the cluster's state and the target group registration to get.
+
 ## Phase status
 
 | Phase | State | Evidence |
@@ -36,38 +100,62 @@ so nothing is listening on NodePort 30080.
 
 ## What blocked the rest
 
-### 1. There is no git remote
+### 1. The git repository is private
 
-`git log` is empty - this repository has never been committed, and it has no
-remote. Argo CD's root Application points at `https://github.com/REPLACE_ME/dpx-infra`
-and reports `SYNC STATUS: Unknown`, which is what "repository not found" looks
-like from inside the cluster.
+Argo CD's root Application points at `https://github.com/AdepuShashank/aws_infra`
+and reports:
 
-Until a remote exists and the `gitops/` tree is pushed:
-
-- Phase 7 and 8 never sync.
-- The ALB health check stays failing.
-- `gitops_repo_url` in `infra/envs/prod/50-platform/prod.tfvars` still needs
-  replacing, along with the `repoURL` in
-  `gitops/prod/apps/projects-applicationset.yaml`.
-
-To unblock:
-
-```powershell
-# create the repository, then:
-git remote add origin <url>
-git add -A
-git commit -m "Bootstrap DPX AWS infrastructure"
-git push -u origin main
+```
+ComparisonError=Failed to load target state: failed to generate manifest for
+source 1 of 1: rpc error: code = Unknown desc = failed to list refs:
+repository not found
 ```
 
-then set `gitops_repo_url` and re-apply `50-platform`.
+Verified from the cluster with no credentials:
+
+```
+api.github.com/repos/AdepuShashank/aws_infra   -> 404
+raw.githubusercontent.com/.../main/README.md   -> 404
+git ls-remote https://github.com/...           -> could not read Username
+```
+
+GitHub returns 404 to unauthenticated callers for a private repository, which is
+indistinguishable from a repository that does not exist. **Do not trust a GitHub
+API response from an authenticated machine here** - it will say `private: false`
+or the call will be cached, and the answer will be wrong.
+
+Fix, either way:
+
+- make the repository public, or
+- give Argo CD a key. The bootstrap script already reads one:
+
+  ```powershell
+  aws ssm put-parameter --name /dpx/prod/k8s/argocd-repo-deploy-key `
+    --type SecureString --key-id <ssm kms key id> --value "$(cat deploy_key)"
+  ```
+
+  The script registers it as a repository Secret and switches the root app to the
+  `ssh://` form.
+
+Until then Phase 7 and 8 never sync, and the ALB target stays unhealthy because
+Traefik is a Phase 7 app.
 
 ### 2. The account has 8 on-demand vCPUs
 
 prod's steady state is 6. prod's MD-default sizing is 8, which AWS accepts
 unreliably. qa's NAT plus control plane is 4 more, so **qa cannot run at the same
-time as prod** at this quota. Full arithmetic and the quota-increase path are in
+time as prod** at this quota.
+
+An increase to **16** has been submitted through the Service Quotas API and is
+pending AWS Support. These are reviewed manually, so it takes hours rather than
+minutes. Check it with:
+
+```powershell
+aws service-quotas get-service-quota --service-code ec2 --quota-code L-1216C47A --region ap-south-1
+```
+
+Full arithmetic and the quota-increase path are in
+[`docs/quota.md`](quota.md); the reasoning is in
 [`docs/quota.md`](quota.md); the reasoning is in
 [`docs/adr/0002-asg-on-demand-allocation.md`](adr/0002-asg-on-demand-allocation.md).
 
