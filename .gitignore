@@ -1,0 +1,89 @@
+# ---------------------------------------------------------------------------
+# Local secrets / credentials
+# ---------------------------------------------------------------------------
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa*
+kubeconfig
+kubeconfig-*
+admin.kubeconfig
+secrets.auto.tfvars
+
+# ---------------------------------------------------------------------------
+# Terraform state (remote S3 backend - local state must never be committed)
+# ---------------------------------------------------------------------------
+*.tfstate
+*.tfstate.*
+*.tfstate.backup
+*.tfplan
+crash.log
+crash.*.log
+
+# Saved plan artefacts. `terraform plan -out=` writes variable values in
+# cleartext into the .bin file, and `-json` writes every value as text - so both
+# are as sensitive as state and are excluded by name rather than by extension.
+# *.tfplan above covers the older naming; these are the two `terraform plan -out`
+# and `terraform show -json` actually produce.
+*.tfplan.bin
+*.tfplan.json
+tfplan.bin
+tfplan.json
+
+# Terraform working dirs / plugin cache
+**/.terraform/*
+**/.terraform.tfstate.lock.info
+.terraformrc
+terraform.rc
+TF_CLI_CONFIG_FILE
+
+# NOTE: .terraform.lock.hcl IS committed on purpose (provider version pinning).
+
+# ---------------------------------------------------------------------------
+# Variable files: environment/common ones ARE committed (no secrets by design).
+# Only secret-bearing files are ignored (see *.secret.auto.tfvars below).
+# ---------------------------------------------------------------------------
+*.secret.auto.tfvars
+*.auto.tfvars
+terraform.tfvars
+override.tf
+override_*.tf
+*_override.tf
+*_override.tf.json
+
+# ---------------------------------------------------------------------------
+# Kubernetes / kubectl
+# ---------------------------------------------------------------------------
+.kube/
+kube/
+*.kubeconfig
+.kubeconfig
+
+# ---------------------------------------------------------------------------
+# Node / cluster runtime artefacts
+# ---------------------------------------------------------------------------
+node_modules/
+*.log
+tmp/
+.tmp/
+
+# ---------------------------------------------------------------------------
+# Editors / OS
+# ---------------------------------------------------------------------------
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---------------------------------------------------------------------------
+# opencode / local tooling
+# ---------------------------------------------------------------------------
+opencode.json
+opencode.jsonc
+.opencode/

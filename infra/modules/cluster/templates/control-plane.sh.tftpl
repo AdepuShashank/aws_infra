@@ -1,0 +1,339 @@
+#!/usr/bin/env bash
+# Control plane bootstrap: common node setup, kubeadm init, SSM publishers, etcd
+# snapshots. Rationale lives in control-plane.tf; this ships to the instance.
+
+set -euxo pipefail
+export DEBIAN_FRONTEND=noninteractive
+
+${common}
+
+log() { echo "[k8s-cp] $*"; }
+
+REGION=${region}
+ENDPOINT=${control_plane_endpoint}
+CONTROL_PLANE_IP=${control_plane_ip}
+API_PORT=${api_server_port}
+ETCD_BUCKET=${etcd_bucket}
+JOIN_SSM=${ssm_join_command}
+HASH_SSM=${ssm_ca_cert_hash}
+KUBECONFIG_SSM=${ssm_kubeconfig}
+STATE_SSM=${ssm_bootstrap_state}
+CLUSTER=${cluster_name}
+K8S_VERSION=${kubernetes_version}
+POD_CIDR=${pod_cidr}
+SERVICE_CIDR=${service_cidr}
+SNAPSHOT_HOURS=${snapshot_hours}
+
+aws configure set region "$REGION"
+
+publish_state() {
+  aws ssm put-parameter --name "$STATE_SSM" --value "$1" --type String \
+    --overwrite --region "$REGION" || log "WARN: could not publish bootstrap state"
+}
+
+publish_state "starting"
+
+# /etc/kubeadm ships with no kubeadm package, so without this the redirect below
+# fails as a shell error and looks like cloud-init just stopped.
+mkdir -p /etc/kubeadm
+cat > /etc/kubeadm/kubeadm-init.yaml <<EOF
+---
+apiVersion: kubeadm.k8s.io/v1beta4
+kind: InitConfiguration
+localAPIEndpoint:
+  advertiseAddress: $CONTROL_PLANE_IP
+  bindPort: $API_PORT
+nodeRegistration:
+  name: cp-$CLUSTER
+  criSocket: unix:///run/containerd/containerd.sock
+  # v1beta4 changed kubeletExtraArgs from a map to a list of {name, value}.
+  # The map form is what every pre-1.36 example on the internet uses, and it
+  # fails as a schema unmarshal error before kubeadm does any work at all:
+  #   cannot unmarshal object into Go struct field
+  #   NodeRegistrationOptions.nodeRegistration.kubeletExtraArgs of type []v1beta4.Arg
+  kubeletExtraArgs:
+    - name: node-ip
+      value: "$CONTROL_PLANE_IP"
+---
+apiVersion: kubeadm.k8s.io/v1beta4
+kind: ClusterConfiguration
+kubernetesVersion: v$K8S_VERSION
+clusterName: $CLUSTER
+controlPlaneEndpoint: $ENDPOINT
+networking:
+  podSubnet: $POD_CIDR
+  serviceSubnet: $SERVICE_CIDR
+  dnsDomain: cluster.local
+apiServer:
+  certSANs:
+${cert_sans_yaml}
+etcd:
+  local:
+    dataDir: /var/lib/etcd
+---
+apiVersion: kubelet.config.k8s.io/v1beta1
+kind: KubeletConfiguration
+cgroupDriver: systemd
+rotateCertificates: true
+serverTLSBootstrap: true
+---
+apiVersion: kubeproxy.config.k8s.io/v1alpha1
+kind: KubeProxyConfiguration
+mode: iptables
+EOF
+
+log "running kubeadm init (controlPlaneEndpoint=$ENDPOINT)"
+
+# Non-fatal on purpose: with no CNI, CoreDNS/kube-proxy stay ContainerCreating until
+# kubeadm's discovery timeout and it exits non-zero. /readyz decides success.
+set +e
+kubeadm init --config /etc/kubeadm/kubeadm-init.yaml
+KUBEADM_RC=$?
+set -e
+log "kubeadm init exited $KUBEADM_RC"
+
+if [ ! -f /etc/kubernetes/admin.conf ]; then
+  publish_state "failed-no-admin-conf"
+  log "ERROR: kubeadm init produced no admin.conf"
+  exit 1
+fi
+
+install -d -m 0700 /root/.kube
+install -m 0600 /etc/kubernetes/admin.conf /root/.kube/config
+export KUBECONFIG=/etc/kubernetes/admin.conf
+
+API_READY=0
+for _ in $(seq 1 60); do
+  if kubectl get --raw='/readyz' >/dev/null 2>&1; then API_READY=1; break; fi
+  sleep 10
+done
+
+if [ "$API_READY" -ne 1 ]; then
+  publish_state "failed-api-not-ready"
+  log "ERROR: API server did not become ready within 600s"
+  exit 1
+fi
+log "API server is ready"
+
+# Advanced tier is required: a base64 admin.conf is ~7500 chars and the Standard
+# tier caps parameter values at 4096, failing the last step.
+aws ssm put-parameter --name "$KUBECONFIG_SSM" \
+  --value "$(base64 -w0 /etc/kubernetes/admin.conf)" --type SecureString \
+  --tier Advanced --overwrite --region "$REGION"
+log "admin kubeconfig published to $KUBECONFIG_SSM"
+
+cat > /usr/local/bin/k8s-publish-join-token <<'JOINEOF'
+#!/usr/bin/env bash
+# Republishes a fresh join command. Failures are logged, not raised: the timer
+# retries in 30 minutes.
+set -uo pipefail
+
+REGION=__REGION__
+ENDPOINT=__ENDPOINT__
+JOIN_SSM=__JOIN_SSM__
+HASH_SSM=__HASH_SSM__
+TOKEN_FILE=/var/lib/k8s-join-token.id
+
+# kubeadm >= 1.36 prints one field "<id>.<secret>", older releases printed
+# "<id> <secret> <expiry>". Normalise both to the form --token takes. Rationale
+# for why this is not a plain `awk '{print $2}'` is in control-plane.tf.
+CREATE_OUT="$(kubeadm token create --ttl 40m 2>/dev/null | head -1)"
+F1="$(printf '%s\n' "$CREATE_OUT" | awk '{print $1}')"
+F2="$(printf '%s\n' "$CREATE_OUT" | awk '{print $2}')"
+
+if [ -n "$F2" ]; then
+  TOKEN="$F1.$F2"
+  TOKEN_ID="$F1"
+else
+  TOKEN="$F1"
+  TOKEN_ID="$(printf '%s\n' "$F1" | cut -d. -f1)"
+fi
+if [ -z "$TOKEN_ID" ] || [ -z "$TOKEN" ]; then
+  echo "WARN: kubeadm token create produced no token" >&2
+  exit 0
+fi
+
+# Derived from the cluster's own CA, so it survives a CA rotation.
+CA_HASH="$(openssl x509 -pubkey -in /etc/kubernetes/pki/ca.crt \
+  | openssl rsa -pubin -outform der 2>/dev/null \
+  | openssl dgst -sha256 -hex | sed 's/^.* //')"
+
+aws ssm put-parameter --name "$HASH_SSM" --value "$CA_HASH" --type SecureString \
+  --overwrite --region "$REGION" || echo "WARN: could not publish CA hash" >&2
+
+aws ssm put-parameter --name "$JOIN_SSM" \
+  --value "kubeadm join $ENDPOINT --token $TOKEN --discovery-token-ca-cert-hash sha256:$CA_HASH" \
+  --type SecureString --tier Advanced --overwrite --region "$REGION" || echo "WARN: could not publish join command" >&2
+
+# Retire the previous token, but only after the new one is published: revoking
+# first leaves a worker booting now with nothing to join with.
+if [ -f "$TOKEN_FILE" ]; then
+  kubeadm token delete "$(cat "$TOKEN_FILE")" 2>/dev/null || true
+fi
+printf '%s' "$TOKEN_ID" > "$TOKEN_FILE"
+chmod 0600 "$TOKEN_FILE"
+
+echo "published join token $TOKEN_ID (ttl 40m)"
+JOINEOF
+
+sed -i \
+  -e "s|__REGION__|$REGION|g" \
+  -e "s|__ENDPOINT__|$ENDPOINT|g" \
+  -e "s|__JOIN_SSM__|$JOIN_SSM|g" \
+  -e "s|__HASH_SSM__|$HASH_SSM|g" \
+  /usr/local/bin/k8s-publish-join-token
+chmod 0755 /usr/local/bin/k8s-publish-join-token
+
+cat > /etc/systemd/system/k8s-join-token.service <<'UNIT'
+[Unit]
+Description=Publish a fresh kubeadm join command to SSM
+After=network-online.target kubelet.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/k8s-publish-join-token
+UNIT
+
+cat > /etc/systemd/system/k8s-join-token.timer <<'TIMER'
+[Unit]
+Description=Refresh the kubeadm join token every 30 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=30min
+AccuracySec=1min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+TIMER
+
+systemctl daemon-reload
+systemctl enable --now k8s-join-token.timer
+/usr/local/bin/k8s-publish-join-token || log "WARN: initial token publish failed; the timer will retry"
+
+# etcdctl must match the etcd kubeadm deployed: a snapshot written by a newer
+# etcdctl against an older server is not guaranteed to restore, and that is only
+# discovered at restore time. So the version is read back out of kubeadm.
+ETCD_IMAGE="$(kubeadm config images list --kubernetes-version "v$K8S_VERSION" 2>/dev/null \
+  | grep -E '/etcd:[0-9]' | head -1)"
+
+# Parsed with cut, not bash prefix/suffix stripping: templatefile claims every
+# braced expression before bash sees the file.
+ETCD_VER="$(printf '%s' "$ETCD_IMAGE" | cut -d: -f2 | cut -d- -f1)"
+
+if [ -z "$ETCD_IMAGE" ] || [ -z "$ETCD_VER" ]; then
+  publish_state "failed-etcd-version-undetermined"
+  log "ERROR: could not determine the etcd version kubeadm would deploy"
+  exit 1
+fi
+
+log "installing etcdctl $ETCD_VER to match the deployed etcd"
+
+case "$(uname -m)" in
+  aarch64 | arm64) ETCD_ARCH=arm64 ;;
+  x86_64) ETCD_ARCH=amd64 ;;
+  *)
+    publish_state "failed-unsupported-arch"
+    log "ERROR: unsupported architecture $(uname -m) for an etcdctl build"
+    exit 1
+    ;;
+esac
+
+ETCD_TARBALL="etcd-v$ETCD_VER-linux-$ETCD_ARCH"
+curl -fsSL --retry 5 \
+  "https://github.com/etcd-io/etcd/releases/download/v$ETCD_VER/$ETCD_TARBALL.tar.gz" \
+  -o /tmp/etcd.tar.gz
+tar -xzf /tmp/etcd.tar.gz -C /tmp
+install -m 0755 "/tmp/$ETCD_TARBALL/etcdctl" /usr/bin/etcdctl
+rm -rf /tmp/etcd.tar.gz "/tmp/$ETCD_TARBALL"
+
+# A timer that fires against a missing binary looks enabled and never produces a
+# snapshot, so the binary is proven before the timer is wired up.
+etcdctl version
+
+# Straight at the local member: going through the service name can land on a peer
+# mid-election, and a snapshot of an unhealthy member restores as corrupt.
+cat > /usr/local/bin/k8s-etcd-snapshot <<'ETCEOF'
+#!/usr/bin/env bash
+set -uo pipefail
+
+REGION=__REGION__
+ETCD_BUCKET=__ETCD_BUCKET__
+SNAP_DIR=/var/backups/etcd
+STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
+LOCAL="$SNAP_DIR/etcd-$STAMP.db"
+
+mkdir -p "$SNAP_DIR"
+# etcdctl writes <file>.part and renames on success, so $LOCAL exists only if the
+# snapshot completed. A MiB floor would wrongly reject a fresh cluster's ~1 MB etcd.
+rm -f "$SNAP_DIR"/*.part
+
+etcdctl snapshot save "$LOCAL" \
+  --endpoints=https://127.0.0.1:2379 \
+  --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+  --cert=/etc/kubernetes/pki/etcd/healthcheck-client.crt \
+  --key=/etc/kubernetes/pki/etcd/healthcheck-client.key \
+  || { echo "ERROR: etcdctl snapshot save failed" >&2; exit 1; }
+
+SIZE="$(stat -c %s "$LOCAL" 2>/dev/null || echo 0)"
+if [ "$SIZE" -lt 4096 ]; then
+  echo "ERROR: snapshot is $SIZE bytes, refusing to upload" >&2
+  exit 1
+fi
+
+# Best-effort integrity check; etcdutl is absent from Ubuntu's etcd package.
+if command -v etcdutl >/dev/null 2>&1; then
+  etcdutl snapshot status "$LOCAL" >/dev/null 2>&1 \
+    || { echo "ERROR: snapshot failed integrity check" >&2; exit 1; }
+fi
+
+# The bucket policy denies uploads without this encryption header.
+aws s3 cp "$LOCAL" "s3://$ETCD_BUCKET/etcd-$STAMP.db" \
+  --region "$REGION" \
+  --sse aws:kms \
+  || { echo "ERROR: upload to S3 failed" >&2; exit 1; }
+
+find "$SNAP_DIR" -name 'etcd-*.db' -mtime +2 -delete
+rm -f "$LOCAL"
+
+echo "snapshot etcd-$STAMP.db ($SIZE bytes) uploaded"
+ETCEOF
+
+sed -i \
+  -e "s|__REGION__|$REGION|g" \
+  -e "s|__ETCD_BUCKET__|$ETCD_BUCKET|g" \
+  /usr/local/bin/k8s-etcd-snapshot
+chmod 0755 /usr/local/bin/k8s-etcd-snapshot
+
+cat > /etc/systemd/system/k8s-etcd-snapshot.service <<'UNIT'
+[Unit]
+Description=Take an etcd snapshot and upload it to S3
+After=kubelet.service
+Wants=kubelet.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/k8s-etcd-snapshot
+UNIT
+
+cat > /etc/systemd/system/k8s-etcd-snapshot.timer <<TIMER
+[Unit]
+Description=Take an etcd snapshot every $SNAPSHOT_HOURS hours
+
+[Timer]
+OnBootSec=15min
+OnUnitActiveSec=$SNAPSHOT_HOURS h
+RandomizedDelaySec=10min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+TIMER
+
+systemctl daemon-reload
+systemctl enable --now k8s-etcd-snapshot.timer
+
+publish_state "bootstrap-complete-cni-pending"
+log "control plane bootstrap finished; nodes NotReady until Calico lands in phase 6"

@@ -1,0 +1,62 @@
+# ---------------------------------------------------------------------------
+# CloudNativePG operator
+# ---------------------------------------------------------------------------
+# The shared Postgres for all ten projects. The operator is installed here; the
+# Cluster itself is created by the ApplicationSet so that it is versioned in the
+# same repository as everything else rather than applied once from a laptop.
+#
+# Wave 5, after the platform is up: nothing depends on the operator existing, but
+# the project scaffolding does depend on the data namespace existing.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: cloudnative-pg
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+
+  source:
+    repoURL: https://cloudnative-pg.github.io/charts
+    chart: cloudnative-pg
+    targetRevision: 0.28.0
+    helm:
+      releaseName: cloudnative-pg
+      values: |
+        crds:
+          # The operator watches for CRD updates itself. Leaving this on means
+          # every sync rewrites three large CRDs for no change.
+          create: false
+
+        operator:
+          # One replica: a single-worker cluster, and two would not both fit
+          # comfortably next to everything else.
+          replicaCount: 1
+          resources:
+            requests:
+              cpu: 25m
+              memory: 64Mi
+
+        # The webhook is what validates Cluster objects on write. Turning it off
+        # means a bad spec is accepted and fails later, inside PostgreSQL.
+        webhook:
+          enabled: true
+          replicaCount: 1
+          resources:
+            requests:
+              cpu: 25m
+              memory: 32Mi
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: cnpg-system
+
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true
+      - RespectIgnoreDifferences=true

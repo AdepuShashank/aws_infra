@@ -1,0 +1,51 @@
+---
+# Pre-commit hooks. Install once with:  pre-commit install
+# Mirrors what CI (.github/workflows/terraform.yml) enforces.
+default_install_hook_types: [pre-commit]
+minimum_pre_commit_version: "3.0.0"
+fail_fast: false
+
+repos:
+  - repo: https://github.com/ansible/tfsec-pre-commit
+    rev: v1.28.14
+    hooks:
+      - id: tfsec
+        args: [--no-colour, --exclude-downloaded-modules, --config-file, .tfsec-config.json]
+
+  - repo: https://github.com/bridgecrewio/checkov
+    rev: 2.14.104
+    hooks:
+      - id: checkov
+        args: [--config-file, .checkov.yaml]
+
+  - repo: https://github.com/terraform-linters/tflint
+    rev: v0.60.0
+    hooks:
+      - id: tflint
+        args: [--fix]
+
+  - repo: https://github.com/antonbabenko/pre-commit-terraform
+    rev: v1.100.0
+    hooks:
+      - id: terraform_fmt
+      - id: terraform_validate
+      - id: terraform_docs
+        args: ["--hook-config=--add-to-existing-file=true"]
+
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: end-of-file-fixer
+        exclude: \.gitkeep$
+      - id: trailing-whitespace
+        args: [--markdown-linebreak-ext=md]
+      - id: check-json
+      - id: check-yaml
+      - id: mixed-line-ending
+        args: [--fix=lf]
+      - id: detect-private-key
+
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.24.0
+    hooks:
+      - id: gitleaks

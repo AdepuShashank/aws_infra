@@ -1,0 +1,59 @@
+# Every value here is overridable per project, and every one of them has a default
+# that keeps a single project's pods from taking the cluster's capacity. With ten
+# projects on one worker, the defaults are what stop one runaway project from
+# starving the other nine - and they are the reason the ResourceQuota and
+# LimitRange below are not optional decoration.
+
+nameOverride: ""
+
+rbac:
+  # Groups granted namespace-admin on this namespace. Matched by name against
+  # existing groups; a group that does not exist is ignored rather than failing
+  # the sync, because RBAC RoleBindings may name a group before anyone is in it.
+  groups:
+    - platform-admins
+
+quota:
+  hard:
+    pods: "10"
+    requests.cpu: "500m"
+    requests.memory: "512Mi"
+    limits.memory: "1Gi"
+    limits.cpu: "1"
+
+limits:
+  default:
+    cpu: 250m
+    memory: 256Mi
+  defaultRequest:
+    cpu: 50m
+    memory: 64Mi
+  # A burst is allowed but bounded. Without this a pod can ask for far more than
+  # its default and the quota becomes the only thing standing between one project
+  # and an OOMKill of everything else on the node.
+  max:
+    cpu: "1"
+    memory: "512Mi"
+  min:
+    cpu: 10m
+    memory: 32Mi
+
+networkPolicy:
+  enabled: true
+
+  # Where Traefik lives. An IngressRoute in this namespace is served by the
+  # Traefik pods there, and the allow rule below has to name the right namespace
+  # or the default-deny silently blocks every request with a connection reset
+  # rather than a useful error.
+  traefikNamespace: traefik
+
+  # Where the shared Postgres lives, and the port the CNPG service listens on.
+  dataNamespace: data
+  postgresPort: 5432
+
+  # Backend egress to the internet. Off by default: this is the rule that decides
+  # whether a compromised backend pod can reach anything off-cluster. Turn it on
+  # per project, not cluster-wide.
+  allowBackendEgress443: false
+  allowBackendEgressPorts:
+    - 443

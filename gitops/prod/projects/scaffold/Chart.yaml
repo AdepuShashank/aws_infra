@@ -1,0 +1,15 @@
+apiVersion: v2
+name: project-scaffold
+description: >-
+  Per-project namespace scaffolding: a locked-down namespace, resource bounds, a
+  service account with namespace-admin RBAC, and the network policies that make
+  Calico enforce the traffic shape the platform assumes.
+
+  One chart rather than ten directories. Each project Application points at this
+  path with a different destination namespace, and everything below templates
+  off .Release.Namespace - so adding a project is one list entry in the
+  ApplicationSet and nothing else, and the ten namespaces cannot drift apart
+  because there is only one copy of the rules.
+type: application
+version: 1.0.0
+appVersion: "1.0"

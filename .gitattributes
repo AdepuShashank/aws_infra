@@ -1,0 +1,24 @@
+# Normalise line endings to LF in the repository, check out native on Windows.
+* text=auto eol=lf
+
+*.tf      text eol=lf
+*.tfvars  text eol=lf
+*.yaml    text eol=lf
+*.yml     text eol=lf
+*.sh      text eol=lf
+*.md      text eol=lf
+*.json    text eol=lf
+*.txt     text eol=lf
+
+# Shell scripts must stay LF even on Windows (they run inside cloud-init).
+*.sh text eol=lf
+
+# Treat generated/secret-ish files as binary so git never rewrites them.
+*.tfstate binary
+*.tfstate.* binary
+*.pem binary
+*.p12 binary
+*.key binary
+*.png binary
+*.jpg binary
+*.zip binary

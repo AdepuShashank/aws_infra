@@ -1,0 +1,76 @@
+# ---------------------------------------------------------------------------
+# Project scaffolding - the ApplicationSet that creates every project namespace.
+# ---------------------------------------------------------------------------
+# A list generator over a literal list, so adding an eleventh project is a
+# one-line change here and nothing else. There is deliberately no git generator:
+# the project list is part of what this repository declares about the environment,
+# not something each project directory should be able to change on its own.
+#
+# One Application per project, each pointing at projects/<name>. The name is the
+# list element, so the Application's name, the namespace and the directory all
+# agree by construction rather than by convention.
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: projects
+  namespace: argocd
+spec:
+  goTemplate: true
+  goTemplateOptions:
+    # Missing keys are a render failure. Silently producing "" for a namespace
+    # would create an Application that targets nothing and reports itself
+    # OutOfSync against an empty path.
+    missingkey: error
+
+  generators:
+    - list:
+        elements:
+          - project: project-01
+          - project: project-02
+          - project: project-03
+          - project: project-04
+          - project: project-05
+          - project: project-06
+          - project: project-07
+          - project: project-08
+          - project: project-09
+          - project: project-10
+
+  template:
+    metadata:
+      name: '{{.project}}'
+      finalizers:
+        - resources-finalizer.argocd.argoproj.io
+    spec:
+      project: default
+      source:
+        # TODO: replace with the real repository before the first sync. Argo CD
+        # reports the failure as an Application stuck with an Unknown sync status
+        # and a "repository not found" condition - visible, but only after
+        # someone is watching the ApplicationSet.
+        repoURL: https://github.com/REPLACE_ME/dpx-infra
+        targetRevision: main
+        # The same scaffold chart for every project. The destination namespace is
+        # what differs, and the chart templates off .Release.Namespace - so there
+        # is exactly one copy of the quota, the limits and the network policies
+        # across all ten namespaces, and they cannot drift apart.
+        path: gitops/prod/projects/scaffold
+      destination:
+        server: https://kubernetes.default.svc
+        namespace: '{{.project}}'
+      syncPolicy:
+        automated:
+          prune: true
+          selfHeal: true
+        syncOptions:
+          # No CreateNamespace: the scaffold chart owns the Namespace so it can set
+          # the Pod Security Admission labels. CreateNamespace would create a bare
+          # one first and the enforcement would never apply.
+          - ServerSideApply=true
+
+  # The generator list is the source of truth. When it changes, the Applications
+  # that no longer have an element are deleted by the ApplicationSet controller -
+  # and with automated prune, that deletes the namespace's contents. So the
+  # policy is preserved, not mirrored.
+  syncPolicy:
+    preserveResourcesOnDeletion: true

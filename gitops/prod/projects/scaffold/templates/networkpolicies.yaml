@@ -1,0 +1,178 @@
+{{- if .Values.networkPolicy.enabled }}
+{{- /*
+  Network policies, in the order they matter:
+
+    1. default-deny both directions - everything else is an exception, not a
+       default
+    2. DNS to kube-system, or the pod cannot resolve anything including the
+       database hostname it is about to be allowed to reach
+    3. Traefik ingress to the labelled frontend/backend pods
+    4. frontend -> backend
+    5. backend -> shared Postgres in the data namespace
+
+  The component label is the contract. Traefik selects pods by
+  app.kubernetes.io/component, so a pod that wants to be reachable has to carry
+  it; nothing here matches on pod name, which is the one thing that changes every
+  time a Deployment rolls.
+
+  Every rule here is additive to the default-deny and none of them grants "all
+  traffic from everywhere to this pod" - a policy that allows from a whole
+  namespace is a policy that allows from every pod in it, including ones nobody
+  has reviewed.
+*/ -}}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/part-of: dpx
+    dpx.io/project: {{ .Release.Namespace | quote }}
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns-egress
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/part-of: dpx
+    dpx.io/project: {{ .Release.Namespace | quote }}
+spec:
+  podSelector: {}
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-traefik-ingress
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/part-of: dpx
+    dpx.io/project: {{ .Release.Namespace | quote }}
+spec:
+  podSelector:
+    matchExpressions:
+      - key: app.kubernetes.io/component
+        operator: In
+        values:
+          - frontend
+          - backend
+  policyTypes:
+    - Ingress
+  ingress:
+    # Only Traefik. Not the ALB: the ALB terminates on the NodePort before
+    # Traefik, so the source address at this point is always a Traefik pod.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.networkPolicy.traefikNamespace }}
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: traefik
+      ports:
+        - protocol: TCP
+          port: 8080
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-frontend-to-backend
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/part-of: dpx
+    dpx.io/project: {{ .Release.Namespace | quote }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: backend
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: frontend
+      ports:
+        - protocol: TCP
+          port: 8080
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-backend-to-postgres
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/part-of: dpx
+    dpx.io/project: {{ .Release.Namespace | quote }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: backend
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.networkPolicy.dataNamespace }}
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: cluster
+      ports:
+        {{- range .Values.networkPolicy.allowBackendEgressPorts }}
+        - protocol: TCP
+          port: {{ . }}
+        {{- end }}
+        - protocol: TCP
+          port: {{ .Values.networkPolicy.postgresPort }}
+{{- if .Values.networkPolicy.allowBackendEgress443 }}
+---
+# Narrow on purpose: 443 to anywhere is a broad rule, and it is the difference
+# between "the backend can call an API" and "the backend can exfiltrate to any
+# host on the internet". Narrow it to named CIDRs before turning it on.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-backend-egress-443
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/part-of: dpx
+    dpx.io/project: {{ .Release.Namespace | quote }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: backend
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+      ports:
+        - protocol: TCP
+          port: 443
+{{- end }}
+{{- end }}

@@ -1,0 +1,33 @@
+{{- /*
+  The namespace, not Argo CD's CreateNamespace.
+
+  CreateNamespace makes a bare Namespace with no labels, and Pod Security
+  Admission reads its labels at admission time - so a namespace created that way
+  has already been evaluated as Privileged before anyone can set enforce=restricted
+  on it. Owning the Namespace here is what lets the enforcement actually mean
+  something.
+*/ -}}
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ .Release.Namespace }}
+  labels:
+    # Pod Security Admission, at the strictest level. Restricted forbids
+    # privileged containers, host namespaces, hostPath volumes and the default
+    # service account token - which is the same set of things the Phase 3 security
+    # baseline forbids at the network layer, restated where the kubelet enforces
+    # it.
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted
+    # These two are what NetworkPolicy selectors in the platform match on.
+    app.kubernetes.io/part-of: dpx
+    dpx.io/project: {{ .Release.Namespace | quote }}
+    dpx.io/env: {{ .Values.environment | default "prod" | quote }}
+  annotations:
+    # Default-deny is applied by the NetworkPolicies in this chart rather than by
+    # a cluster-wide default, because a NetworkPolicy only takes effect for
+    # namespaces that have one and a "select all" default-deny in the platform
+    # would silently block the platform's own namespaces too.
+    dpx.io/scaffold: "true"

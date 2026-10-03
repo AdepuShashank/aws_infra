@@ -1,0 +1,310 @@
+#!/usr/bin/env bash
+# ---------------------------------------------------------------------------
+# Platform bootstrap: Calico, then Argo CD, then the root Application.
+# ---------------------------------------------------------------------------
+# Runs on the control plane over SSM Run Command, which is why Terraform never
+# needs the kubernetes or helm providers. The API server is private, so there is
+# no path from a CI runner into the cluster; the only bridge is an SSM command
+# executed on a node that is already inside the VPC.
+#
+# Every step is idempotent. The script is re-run by hand often enough that
+# "create, and if it exists, replace" is the only sane default, and re-running it
+# must converge rather than error out.
+#
+# Ordering matters and is not arbitrary:
+#   1. Calico first. Without a CNI the nodes stay NotReady and no other pod can
+#      be scheduled, so nothing installed later would actually run.
+#   2. Argo CD next, and only once the nodes are Ready - its pods need scheduling.
+#   3. The root Application last, because it points at a directory that Phase 7
+#      fills in; creating it before then would sync an empty tree and report
+#      itself OutOfSync for no useful reason.
+
+set -euo pipefail
+
+REGION="${region}"
+STATE_SSM="${state_ssm}"
+ARGOCD_PASSWORD_SSM="${argocd_password_ssm}"
+ARGOCD_REPO_KEY_SSM="${argocd_repo_key_ssm}"
+CALICO_VERSION="${calico_version}"
+HELM_VERSION="${helm_version}"
+HELM_SHA256="${helm_sha256}"
+ARGOCD_CHART_VERSION="${argocd_chart_version}"
+CLUSTER_NAME="${cluster_name}"
+GITHUB_SSH_HOST="${gitops_ssh_host}"
+GITOPS_REPO_URL="${gitops_repo_url}"
+GITOPS_REPO_PATH="${gitops_repo_path}"
+GITOPS_TARGET_REVISION="${gitops_target_revision}"
+POD_CIDR="${pod_cidr}"
+
+export KUBECONFIG=/etc/kubernetes/admin.conf
+
+publish_state() {
+  aws ssm put-parameter --name "$STATE_SSM" --value "$1" --type String \
+    --overwrite --region "$REGION" >/dev/null 2>&1 || true
+  echo "[platform-bootstrap] state: $1"
+}
+
+trap 'publish_state "failed at line $LINENO"' ERR
+
+publish_state "starting"
+
+# ---------------------------------------------------------------------------
+# Wait for the API server
+# ---------------------------------------------------------------------------
+# The association can fire while the control plane is still finishing kubeadm init.
+# Retrying the readiness loop is the difference between this script being safe to
+# re-run and it racing the thing it depends on.
+log() { echo "[platform-bootstrap] $*"; }
+
+log "waiting for the API server"
+for i in $(seq 1 60); do
+  if kubectl get --raw /readyz >/dev/null 2>&1; then
+    log "API server ready after $i attempt(s)"
+    break
+  fi
+  if [ "$i" -eq 60 ]; then
+    log "ERROR: API server not ready after 10 minutes"
+    exit 1
+  fi
+  sleep 10
+done
+
+# ---------------------------------------------------------------------------
+# Calico
+# ---------------------------------------------------------------------------
+# CRDs first, then the operator, then the Installation custom resource.
+#
+# The Installation resource is rendered here rather than fetched. Upstream's
+# custom-resources.yaml ships an IP pool of 192.168.0.0/16, and the pod CIDR this
+# cluster was initialised with is $POD_CIDR. Applying the stock manifest
+# unchanged produces a cluster whose kubelet asks for addresses from a block the
+# API server never allocated from, which shows up as every pod stuck in ContainerCreating
+# and an IP pool that no node is using.
+#
+# kubectl create, not apply, for the CRDs: the bundle is ~3 MB and apply exceeds
+# the API server's request limit. create fails harmlessly on a re-run, hence the
+# fallback.
+log "installing Calico CRDs ($CALICO_VERSION)"
+MANIFESTS="https://raw.githubusercontent.com/projectcalico/calico/$CALICO_VERSION/manifests"
+
+kubectl create -f "$MANIFESTS/v1_crd_projectcalico_org.yaml" ||
+  kubectl replace --force -f "$MANIFESTS/v1_crd_projectcalico_org.yaml"
+
+log "waiting for the Calico CRDs to be established"
+for i in $(seq 1 30); do
+  if kubectl get crd installations.operator.tigera.io >/dev/null 2>&1; then
+    break
+  fi
+  sleep 5
+done
+
+log "installing the tigera operator"
+kubectl create -f "$MANIFESTS/tigera-operator.yaml" ||
+  kubectl apply -f "$MANIFESTS/tigera-operator.yaml"
+
+kubectl -n tigera-operator rollout status deployment/tigera-operator --timeout=300s
+
+log "creating the Calico Installation with pod CIDR $POD_CIDR"
+cat <<EOF | kubectl apply -f -
+apiVersion: operator.tigera.io/v1
+kind: Installation
+metadata:
+  name: default
+spec:
+  calicoNetwork:
+    bgp: Disabled
+    ipPools:
+      - blockSize: 26
+        cidr: $POD_CIDR
+        encapsulation: VXLAN
+        natOutgoing: Enabled
+        nodeSelector: all()
+EOF
+
+log "waiting for the Calico daemonset to roll out"
+for i in $(seq 1 90); do
+  DS_READY="$(kubectl -n calico-system get daemonset calico-node -o jsonpath='{.status.numberReady}' 2>/dev/null || echo 0)"
+  DS_DESIRED="$(kubectl -n calico-system get daemonset calico-node -o jsonpath='{.status.desiredNumberScheduled}' 2>/dev/null || echo 0)"
+  if [ "$${DS_READY:-0}" -gt 0 ] && [ "$DS_READY" = "$DS_DESIRED" ]; then
+    log "calico-node ready: $DS_READY/$DS_DESIRED"
+    break
+  fi
+  if [ "$i" -eq 90 ]; then
+    log "ERROR: calico-node did not become ready ($DS_READY/$DS_DESIRED)"
+    exit 1
+  fi
+  sleep 10
+done
+
+publish_state "calico-installed"
+
+# ---------------------------------------------------------------------------
+# Helm
+# ---------------------------------------------------------------------------
+# Installed here rather than in cloud-init because Phase 6 is the first thing that
+# needs it and Phase 4 has no reason to carry a ~50 MB download. The checksum is
+# verified, so the download is pinned to this exact artifact rather than to a URL.
+log "installing helm $HELM_VERSION"
+case "$(uname -m)" in
+  aarch64 | arm64) HELM_ARCH=arm64 ;;
+  x86_64) HELM_ARCH=amd64 ;;
+  *)
+    log "ERROR: unsupported architecture $(uname -m)"
+    exit 1
+    ;;
+esac
+
+HELM_TARBALL="helm-v$HELM_VERSION-linux-$HELM_ARCH.tar.gz"
+curl -fsSL --retry 5 "https://get.helm.sh/$HELM_TARBALL" -o "/tmp/$HELM_TARBALL"
+
+# The published sha256sum file names the file it belongs to; the first field is
+# the digest, which is the only part compared here.
+REMOTE_SHA="$(curl -fsSL --retry 5 "https://get.helm.sh/$HELM_TARBALL.sha256sum" | awk '{print $1}')"
+echo "$REMOTE_SHA  /tmp/$HELM_TARBALL" | sha256sum -c - >/dev/null ||
+  { log "ERROR: helm checksum mismatch (expected $HELM_SHA256)"; exit 1; }
+
+tar -xzf "/tmp/$HELM_TARBALL" -C /tmp
+install -m 0755 "/tmp/linux-$HELM_ARCH/helm" /usr/local/bin/helm
+rm -rf "/tmp/$HELM_TARBALL" "/tmp/linux-$HELM_ARCH"
+
+# helm's own state and cache belong on disk, not in $HOME, which is read-only-ish
+# and not predictable under systemd.
+export HELM_CACHE_HOME=/var/cache/helm
+export HELM_CONFIG_HOME=/var/lib/helm
+export HELM_DATA_HOME=/var/lib/helm
+mkdir -p "$HELM_CACHE_HOME" "$HELM_CONFIG_HOME" "$HELM_DATA_HOME"
+
+helm repo add argo https://argoproj.github.io/argo-helm
+helm repo update
+
+# ---------------------------------------------------------------------------
+# Argo CD
+# ---------------------------------------------------------------------------
+# ClusterIP only. The spec's "not publicly exposed" is load-bearing: an Argo CD
+# server reachable from the internet is an unauthenticated GitOps control plane
+# with cluster-admin behind it, and the admin password lives in a Secret.
+log "installing Argo CD (chart $ARGOCD_CHART_VERSION)"
+helm upgrade --install argocd argo/argo-cd \
+  --version "$ARGOCD_CHART_VERSION" \
+  --namespace argocd \
+  --create-namespace \
+  --set global.domain="argocd.internal.${cluster_name}.invalid" \
+  --set server.service.type=ClusterIP \
+  --set server.extraArgs."server.insecure"=false \
+  --set controller.clusterAdminAccess.enabled=true \
+  --set controller.repoServer.parallelismLimit=2 \
+  --set controller.operation.processors.num=2 \
+  --set controller.status.processors.num=2 \
+  --set controller.application.resourceTrackingMethod=annotation \
+  --set redis-ha.enabled=false \
+  --set timeout.replication=60s \
+  --wait \
+  --timeout 15m
+
+kubectl -n argocd rollout status deployment/argocd-server --timeout=600s
+kubectl -n argocd rollout status deployment/argocd-repo-server --timeout=600s
+
+log "waiting for the Argo CD API to answer"
+for i in $(seq 1 60); do
+  if kubectl -n argocd exec statefulset/argocd-application-controller -- argocd-application-controller health --timeout 5s >/dev/null 2>&1; then
+    break
+  fi
+  sleep 10
+done
+
+publish_state "argocd-installed"
+
+# ---------------------------------------------------------------------------
+# Admin password into SSM
+# ---------------------------------------------------------------------------
+# The initial admin password Secret only exists until the first admin changes the
+# password. Reading it out of the Secret and storing it under the cluster's own
+# parameter prefix is what makes `scripts/kubeconfig-via-ssm.sh` able to log in
+# without anyone ever pasting a password into a terminal.
+log "publishing the Argo CD admin password to $ARGOCD_PASSWORD_SSM"
+ARGOCD_PASSWORD="$(kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath='{.data.password}' | base64 -d)"
+kubectl -n argocd patch secret argocd-initial-admin-secret -p '{"stringData":{"password":"'"$ARGOCD_PASSWORD"'"}}' --type=merge >/dev/null
+
+aws ssm put-parameter --name "$ARGOCD_PASSWORD_SSM" --value "$ARGOCD_PASSWORD" \
+  --type SecureString --overwrite --region "$REGION"
+
+# ---------------------------------------------------------------------------
+# Repository credentials
+# ---------------------------------------------------------------------------
+# A private repo gets a deploy key from SSM registered as a repository Secret. A
+# public repo needs none, and asking for one that does not exist would fail the
+# step for no reason, so the presence of the parameter decides.
+REPO_PRIVATE="$(aws ssm get-parameter --name "$ARGOCD_REPO_KEY_SSM" --query 'Parameter.Value' --output text 2>/dev/null || true)"
+
+if [ -n "$REPO_PRIVATE" ] && [ "$REPO_PRIVATE" != "None" ]; then
+  REPO_IS_PRIVATE=true
+else
+  REPO_IS_PRIVATE=false
+  log "no deploy key at $ARGOCD_REPO_KEY_SSM: assuming the repository is public"
+fi
+
+if [ "$REPO_IS_PRIVATE" = "true" ]; then
+  log "repository is private: registering a deploy key as a repository Secret"
+  # The secret-type label is what makes argocd-repo-server pick this up. Without it
+  # the secret exists, the Application references it, and every sync fails with a
+  # bare "repository not found" - the label is the only thing that connects the two.
+  kubectl -n argocd create secret generic repo-deploy-key \
+    --from-literal=ssh-privatekey="$REPO_PRIVATE" \
+    --dry-run=client -o yaml |
+    kubectl label --local -f - argocd.argoproj.io/secret-type=repository -o yaml |
+    kubectl apply -f -
+fi
+
+# ---------------------------------------------------------------------------
+# Root Application (app of apps)
+# ---------------------------------------------------------------------------
+# Applied rather than created through the argocd CLI. The CLI path means waiting
+# for the API to answer and authenticating with the admin password, which is two
+# more things that can time out; applying the resource needs neither and is
+# reviewable as plain YAML.
+#
+# repoURL switches to the ssh:// form when a deploy key exists, because that is
+# what makes the repo-server reach for the secret above instead of trying the
+# public https endpoint and failing on a private repo. GITHUB_SSH_HOST is supplied
+# by the caller because the ssh:// form needs a host prefix that differs between
+# github.com and a self-hosted Git server.
+if [ "$REPO_IS_PRIVATE" = "true" ]; then
+  EFFECTIVE_REPO_URL="ssh://git@$${GITHUB_SSH_HOST}/$${GITOPS_REPO_URL}"
+else
+  EFFECTIVE_REPO_URL="$GITOPS_REPO_URL"
+fi
+
+log "creating the root Application pointing at $EFFECTIVE_REPO_URL:$GITOPS_REPO_PATH"
+cat <<EOF | kubectl apply -f -
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: root
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: $EFFECTIVE_REPO_URL
+    targetRevision: $GITOPS_TARGET_REVISION
+    path: $GITOPS_REPO_PATH
+    directory:
+      recurse: true
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: argocd
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true
+EOF
+
+publish_state "platform-bootstrap-complete"
+
+log "platform bootstrap finished"
+log "  kubectl -n argocd get applications -w"
+log "  admin password is in SSM: $ARGOCD_PASSWORD_SSM"

@@ -1,0 +1,61 @@
+{{- /*
+  Namespace-scoped admin, granted to named groups.
+
+  A Role, not a ClusterRole: a Role cannot be bound in another namespace, so this
+  grant cannot be escalated by an operator who also holds it elsewhere. The
+  RoleBinding names groups only - no ServiceAccount - because a ServiceAccount
+  binding here would be a cluster-wide privilege for anyone who could create one
+  in this namespace, and creating a ServiceAccount in a namespace is usually
+  permitted.
+*/ -}}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: project-deployer
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/part-of: dpx
+    dpx.io/project: {{ .Release.Namespace | quote }}
+automountServiceAccountToken: false
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: project-admin
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/part-of: dpx
+    dpx.io/project: {{ .Release.Namespace | quote }}
+rules:
+  # Everything inside the namespace, and nothing outside it. There is no wildcard
+  # rule and no cluster-scoped rule: a project that needs a cluster resource is a
+  # platform change, not a per-project grant.
+  - apiGroups: ["*"]
+    resources: ["*"]
+    verbs: ["*"]
+  # Non-resource URLs are namespaced too, but binding them via a Role silently
+  # does nothing, so they are listed explicitly to make the limit visible.
+  - nonResourceURLs: []
+    verbs: []
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: project-admin
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/part-of: dpx
+    dpx.io/project: {{ .Release.Namespace | quote }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: project-admin
+subjects:
+  {{- range .Values.rbac.groups }}
+  # A group that does not exist yet is not an error. RBAC accepts the binding and
+  # it starts taking effect when the group appears, which is what makes "create
+  # the namespace first, invite people second" work.
+  - apiGroup: rbac.authorization.k8s.io
+    kind: Group
+    name: {{ . | quote }}
+  {{- end }}

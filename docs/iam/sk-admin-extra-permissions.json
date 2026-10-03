@@ -1,0 +1,249 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "SSMParameterStoreAndRunCommand",
+      "Effect": "Allow",
+      "Action": [
+        "ssm:GetParameter",
+        "ssm:GetParameters",
+        "ssm:GetParametersByPath",
+        "ssm:GetParameterHistory",
+        "ssm:DescribeParameters",
+        "ssm:PutParameter",
+        "ssm:DeleteParameter",
+        "ssm:DeleteParameters",
+        "ssm:GetParametersByPaths",
+        "ssm:LabelParameter",
+        "ssm:UnlabelParameter",
+        "ssm:GetDocument",
+        "ssm:DescribeDocument",
+        "ssm:ListDocuments",
+        "ssm:CreateDocument",
+        "ssm:CreateDocumentVersion",
+        "ssm:DeleteDocument",
+        "ssm:SendCommand",
+        "ssm:ListCommandInvocations",
+        "ssm:ListCommands",
+        "ssm:GetCommandInvocation",
+        "ssm:CancelCommand",
+        "ssm:DescribeInstanceInformation",
+        "ssm:UpdateInstanceInformation",
+        "ssm:RegisterTargetWithMaintenanceWindow",
+        "ssm:RemoveTargetsFromMaintenanceWindow",
+        "ssm:DeregisterTargetFromMaintenanceWindow",
+        "ssm:DescribeMaintenanceWindows",
+        "ssm:DescribeMaintenanceWindowExecutions",
+        "ssm:DescribeMaintenanceWindowTasks",
+        "ssm:StartSession",
+        "ssm:TerminateSession",
+        "ssmmessages:CreateControlChannel",
+        "ssmmessages:CreateDataChannel",
+        "ssmmessages:OpenControlChannel",
+        "ssmmessages:OpenDataChannel",
+        "ssm:ListAssociations",
+        "ssm:DescribeAssociation",
+        "ssm:GetDeployablePatchSnapshotForInstance",
+        "ssm:ListInstanceAssociations",
+        "ssm:ModifyDocumentPermission",
+        "ssm:AddTagsToResource",
+        "ssm:ListTagsForResource",
+        "ssm:RemoveTagsFromResource",
+        "ssm:CreateAssociation",
+        "ssm:DeleteAssociation",
+        "ssm:UpdateAssociation",
+        "ssm:DescribeDocumentPermission"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "SSMPublicParametersForAMISelection",
+      "Effect": "Allow",
+      "Action": [
+        "ssm:GetParameterByPath"
+      ],
+      "Resource": "arn:aws:ssm:*:*:parameter/aws/service/*"
+    },
+    {
+      "Sid": "AWSBudgets",
+      "Effect": "Allow",
+      "Action": [
+        "budgets:ViewBudget",
+        "budgets:CreateBudget",
+        "budgets:ModifyBudget",
+        "budgets:DeleteBudget",
+        "budgets:ViewBudgetAction",
+        "budgets:CreateBudgetAction",
+        "budgets:ModifyBudgetAction",
+        "budgets:DeleteBudgetAction",
+        "budgets:ExecuteBudgetAction",
+        "budgets:CreateSubscriber",
+        "budgets:DeleteSubscriber",
+        "budgets:ViewSubscribers",
+        "budgets:ListTagsForResource",
+        "budgets:TagResource",
+        "budgets:UntagResource"
+      ],
+      "Resource": [
+        "arn:aws:budgets::580857072251:budget/*",
+        "arn:aws:budgets::580857072251:budget-action/*"
+      ]
+    },
+    {
+      "Sid": "SNSTopicsAndSubscriptions",
+      "Effect": "Allow",
+      "Action": [
+        "sns:CreateTopic",
+        "sns:DeleteTopic",
+        "sns:ListTopics",
+        "sns:GetTopicAttributes",
+        "sns:SetTopicAttributes",
+        "sns:Publish",
+        "sns:Subscribe",
+        "sns:Unsubscribe",
+        "sns:ListSubscriptionsByTopic",
+        "sns:GetSubscriptionAttributes",
+        "sns:SetSubscriptionAttributes",
+        "sns:ListTagsForResource",
+        "sns:TagResource",
+        "sns:UntagResource",
+        "sns:AddPermission",
+        "sns:RemovePermission",
+        "sns:GetEndpointByProtocol"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "EventBridgeRules",
+      "Effect": "Allow",
+      "Action": [
+        "events:PutRule",
+        "events:PutTargets",
+        "events:PutPermission",
+        "events:RemoveTargets",
+        "events:DeleteRule",
+        "events:DisableRule",
+        "events:EnableRule",
+        "events:DescribeRule",
+        "events:ListRules",
+        "events:ListTargetsByRule",
+        "events:ListTagsForResource",
+        "events:TagResource",
+        "events:UntagResource"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "EventBridgeScheduler",
+      "Effect": "Allow",
+      "Action": [
+        "scheduler:CreateSchedule",
+        "scheduler:UpdateSchedule",
+        "scheduler:DeleteSchedule",
+        "scheduler:GetSchedule",
+        "scheduler:ListSchedules",
+        "scheduler:ListScheduleGroups",
+        "scheduler:ListTargetsBySchedule",
+        "scheduler:CreateScheduleGroup",
+        "scheduler:DeleteScheduleGroup",
+        "scheduler:GetScheduleGroup",
+        "scheduler:ListTagsForResource",
+        "scheduler:TagResource",
+        "scheduler:UntagResource"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "DataLifecycleManager",
+      "Effect": "Allow",
+      "Action": [
+        "dlm:CreateLifecyclePolicy",
+        "dlm:UpdateLifecyclePolicy",
+        "dlm:DeleteLifecyclePolicy",
+        "dlm:GetLifecyclePolicy",
+        "dlm:GetLifecyclePolicies",
+        "dlm:ListLifecyclePolicies",
+        "dlm:ListTagsForResource",
+        "dlm:TagResource",
+        "dlm:UntagResource",
+        "dlm:AddCrossRegionCopyRule",
+        "dlm:RemoveCrossRegionCopyRule"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "Route53OptionalDomain",
+      "Effect": "Allow",
+      "Action": [
+        "route53:ListHostedZones",
+        "route53:ListHostedZonesByName",
+        "route53:GetHostedZone",
+        "route53:GetHostedZoneCount",
+        "route53:CreateHostedZone",
+        "route53:DeleteHostedZone",
+        "route53:ListResourceRecordSets",
+        "route53:ChangeResourceRecordSets",
+        "route53:ListTagsForResource",
+        "route53:TagResource",
+        "route53:UntagResource"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "KMSKeyManagement",
+      "Effect": "Allow",
+      "Action": [
+        "kms:CreateKey",
+        "kms:CreateAlias",
+        "kms:DeleteAlias",
+        "kms:UpdateAlias",
+        "kms:DescribeKey",
+        "kms:GetKeyPolicy",
+        "kms:GetKeyRotationStatus",
+        "kms:ListKeys",
+        "kms:ListAliases",
+        "kms:ListResourceTags",
+        "kms:EnableKeyRotation",
+        "kms:DisableKeyRotation",
+        "kms:ScheduleKeyDeletion",
+        "kms:CancelKeyDeletion",
+        "kms:PutKeyPolicy",
+        "kms:TagResource",
+        "kms:UntagResource"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "KMSUseForSecretsAndVolumes",
+      "Effect": "Allow",
+      "Action": [
+        "kms:Decrypt",
+        "kms:Encrypt",
+        "kms:GenerateDataKey",
+        "kms:GenerateDataKeyWithoutPlaintext",
+        "kms:GenerateRandom",
+        "kms:CreateGrant",
+        "kms:ListGrants",
+        "kms:RevokeGrant"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "ACMOptionalCerts",
+      "Effect": "Allow",
+      "Action": [
+        "acm:ListCertificates",
+        "acm:DescribeCertificate",
+        "acm:RequestCertificate",
+        "acm:AddTagsToCertificate",
+        "acm:RemoveTagsFromCertificate",
+        "acm:ListTagsForCertificate",
+        "acm:ImportCertificate",
+        "acm:DeleteCertificate",
+        "acm:PutAccountDefault",
+        "acm:GetAccountConfiguration"
+      ],
+      "Resource": "*"
+    }
+  ]
+}

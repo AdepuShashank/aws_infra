@@ -1,0 +1,110 @@
+# ---------------------------------------------------------------------------
+# AWS EBS CSI driver + an encrypted gp3 default StorageClass.
+# ---------------------------------------------------------------------------
+# Wave 1: nothing can create a PersistentVolumeClaim before the driver exists, so
+# this is the first app in the sync order. Traefik's PVCs are the usual first
+# casualty of getting this wrong.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: ebs-csi-driver
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+
+  source:
+    repoURL: https://github.com/kubernetes-sigs/aws-ebs-csi-driver
+    targetRevision: v2.64.0
+    path: charts/aws-ebs-csi-driver
+    helm:
+      releaseName: aws-ebs-csi-driver
+      values: |
+        controller:
+          # arm64 images are published for this chart; the Graviton decision in
+          # Infrastructure.MD depends on it, so it is pinned here rather than
+          # inherited from the chart default.
+          image:
+            tag: v1.64.0
+          volumePermissionsFeature:
+            enabled: false
+          resources:
+            requests:
+              cpu: 25m
+              memory: 64Mi
+          serviceAccount:
+            annotations:
+              # IRSA onto the node role created in 20-security, which already
+              # carries the EBS CSI permissions and is scoped to this cluster's
+              # own KMS keys and buckets. No new IAM role is created here: a
+              # second role for the same permissions is one more thing to keep in
+              # sync with 20-security and nothing to show for it.
+              #
+              # Hardcoded because the OIDC provider is per-account and the role is
+              # per-environment, and gitops/ is plain YAML with no templating. If
+              # the role is ever renamed, this annotation has to change with it -
+              # and the failure is visible: the driver logs a credentials error
+              # and no PVC binds.
+              eks.amazonaws.com/role-arn: arn:aws:iam::580857072251:role/dpx-prod-node-role
+
+        # Two node pools would otherwise place one of each per node, which is
+        # more than a cluster this size can afford.
+        daemonset:
+          tolerations:
+            - operator: Exists
+          nodeSelector:
+            kubernetes.io/os: linux
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: kube-system
+
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - ServerSideApply=true
+      - RespectIgnoreDifferences=true
+
+  ignoreDifferences:
+    # The chart renders a default StorageClass named after itself. It is created
+    # here as its own manifest below with encryption and reclaim policy set, so
+    # Argo CD must not fight the chart over it.
+    - group: storage.k8s.io
+      kind: StorageClass
+      name: ebs-sc
+      jsonPointers:
+        - /parameters/type
+        - /reclaimPolicy
+
+---
+# The default StorageClass. Written by hand rather than taken from the chart
+# because the two things that matter here are not the chart's defaults:
+#
+#   type: gp3       the chart defaults to gp2, which costs more per GB and is
+#                   slower. This is a cost-lean environment.
+#   encrypted: true every volume the CSI driver creates should be encrypted with
+#                   the account's EBS KMS key, matching what 30-cluster does for
+#                   node root volumes.
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: ebs-sc
+  annotations:
+    storageclass.kubernetes.io/is-default-class: "true"
+spec:
+  provisioner: ebs.csi.aws.com
+  type: gp3
+  encrypted: "true"
+  # Delete, not Retain. These are disposable environments that are torn down
+  # often; a Retain policy would leave volumes behind on every teardown with
+  # nothing left to manage them.
+  reclaimPolicy: Delete
+  volumeBindingMode: WaitForFirstConsumer
+  allowVolumeExpansion: true
+  parameters:
+    type: gp3
+    encrypted: "true"
+    fsType: ext4

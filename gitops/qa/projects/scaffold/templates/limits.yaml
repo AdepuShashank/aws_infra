@@ -1,0 +1,23 @@
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: project-quota
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/part-of: dpx
+    dpx.io/project: {{ .Release.Namespace | quote }}
+spec:
+  hard:
+    {{- toYaml .Values.quota.hard | nindent 4 }}
+---
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: project-limits
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/part-of: dpx
+    dpx.io/project: {{ .Release.Namespace | quote }}
+spec:
+  limits:
+    {{- toYaml .Values.limits | nindent 4 }}

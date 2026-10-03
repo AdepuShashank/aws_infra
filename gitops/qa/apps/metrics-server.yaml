@@ -1,0 +1,51 @@
+# ---------------------------------------------------------------------------
+# metrics-server
+# ---------------------------------------------------------------------------
+# Needed before kubectl top and before any HPA works. Cheap enough to always be on:
+# it is one Deployment and a handful of DaemonSet pods.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: metrics-server
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+
+  source:
+    repoURL: https://github.com/kubernetes-sigs/metrics-server
+    targetRevision: v3.14.0
+    path: components/metrics-server
+    helm:
+      releaseName: metrics-server
+      values: |
+        image:
+          registry: registry.k8s.io
+          repository: metrics-server
+          tag: v0.9.0
+
+        args:
+          # Required, not a default worth relying on. kubelet serves metrics over
+          # a self-signed certificate; without these two flags metrics-server
+          # refuses to scrape it and kubectl top prints "Metrics API not available"
+          # while every other component looks healthy.
+          - --kubelet-insecure-tls
+          - --kubelet-preferred-address-types=InternalIP,ExternalIP,Hostname
+
+        resources:
+          requests:
+            cpu: 25m
+            memory: 64Mi
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: kube-system
+
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - ServerSideApply=true
+      - RespectIgnoreDifferences=true

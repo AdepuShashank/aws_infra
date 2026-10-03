@@ -1,0 +1,152 @@
+#!/usr/bin/env bash
+# Shared node bootstrap: swap, kernel, containerd, kubeadm packages.
+# Rendered by Terraform and embedded into each node's user-data. Ordering is
+# deliberate: swap -> modules -> sysctls -> packages -> containerd -> k8s.
+# Full rationale is in control-plane.tf and workers.tf; user-data-guard.tf caps
+# the shipped size, so comments here are kept to the load-bearing ones.
+
+set -euxo pipefail
+
+export DEBIAN_FRONTEND=noninteractive
+
+# Mirrored to the serial console: until the SSM agent is up there is no way in,
+# and get-console-output is the only outside signal of how far a bootstrap got.
+progress() { echo "[k8s-node] $*" | tee -a /dev/console; }
+
+progress "starting shared node bootstrap"
+
+# swapoff: kubelet will not start while swap is on.
+swapoff -a
+sed -ri 's@^([^#].*\sswap\s)@#\1@' /etc/fstab
+
+# overlay for the containerd snapshotter; br_netfilter so bridged traffic
+# traverses iptables, without which kube-proxy service rules are bypassed.
+cat > /etc/modules-load.d/kubernetes.conf <<'MODULES'
+overlay
+br_netfilter
+MODULES
+modprobe overlay
+modprobe br_netfilter
+
+cat > /etc/sysctl.d/99-kubernetes.conf <<'SYSCTLS'
+net.bridge.bridge-nf-call-iptables  = 1
+net.bridge.bridge-nf-call-ip6tables = 1
+net.ipv4.ip_forward                 = 1
+SYSCTLS
+sysctl --system
+
+progress "host prepared"
+
+# Retries matter: the only internet egress is the NAT instance, and a transient
+# blip there otherwise leaves a half-installed node the ASG replaces in a loop.
+cat > /etc/apt/apt.conf.d/80-retries <<'APT'
+Acquire::Retries "5";
+APT
+
+apt-get update
+apt-get install -y --no-install-recommends \
+  ca-certificates \
+  curl \
+  gnupg \
+  openssl \
+  tar \
+  apt-transport-https \
+  unzip \
+  iptables \
+  conntrack \
+  socat \
+  ethtool
+
+progress "base packages installed"
+
+# The SSM agent is deliberately not installed here: the Ubuntu 24.04 image
+# already carries amazon-ssm-agent as a snap, with no /opt/aws copy and no
+# amazon-ssm-agent.service, which is exactly why this is easy to get wrong.
+# Checking it is worth the bytes, because a node that cannot reach SSM is
+# unmanageable and its worker can never read a join command, and that failure
+# is silent from outside the instance.
+if ! snap services amazon-ssm-agent 2>/dev/null | grep -q enabled; then
+  systemctl enable --now snap.amazon-ssm-agent.amazon-ssm-agent.service
+fi
+
+progress "ssm agent present"
+
+# containerd from Docker's repo, not Ubuntu's: noble ships 1.6.x and kubeadm
+# reports the CRI mismatch as "container runtime is not running".
+install -m 0755 -d /etc/apt/keyrings
+curl -fsSL --retry 5 https://download.docker.com/linux/ubuntu/gpg \
+  | gpg --dearmor --yes -o /etc/apt/keyrings/docker.gpg
+chmod 0644 /etc/apt/keyrings/docker.gpg
+
+echo "deb [arch=arm64 signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu ${containerd_repo_ubuntu} stable" \
+  > /etc/apt/sources.list.d/docker.list
+
+apt-get update
+
+CONTAINERD_PKG="containerd.io"
+if [ -n "${containerd_version_pin}" ]; then
+  CONTAINERD_PKG="containerd.io=${containerd_version_pin}"
+fi
+
+apt-get install -y --no-install-recommends "$CONTAINERD_PKG"
+
+# SystemdCgroup is mandatory: kubelet defaults to cgroupfs, containerd to
+# systemd, and the mismatch strands every pod in ContainerCreating.
+mkdir -p /etc/containerd
+containerd config default > /etc/containerd/config.toml
+sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
+
+systemctl daemon-reload
+systemctl enable --now containerd
+systemctl restart containerd
+
+progress "containerd running"
+
+# pkgs.k8s.io, not apt.kubernetes.io, which is frozen at v1.32.
+install -m 0755 -d /etc/apt/keyrings
+curl -fsSL --retry 5 https://pkgs.k8s.io/core:/stable:/v${kubernetes_minor}/deb/Release.key \
+  | gpg --dearmor --yes -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+chmod 0644 /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+
+echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v${kubernetes_minor}/deb/ /" \
+  > /etc/apt/sources.list.d/kubernetes.list
+
+apt-get update
+
+# Exact pins: kubeadm refuses to work across a kubelet version skew, and hold
+# keeps unattended-upgrades from moving them either.
+apt-get install -y --no-install-recommends \
+  "kubelet=${kubernetes_pkg_version}" \
+  "kubeadm=${kubernetes_pkg_version}" \
+  "kubectl=${kubernetes_pkg_version}"
+apt-mark hold kubelet kubeadm kubectl
+
+systemctl enable kubelet
+
+progress "kubernetes packages installed"
+
+# awscli v2 from the zip, not pip: a pip-installed v1 lacks IMDSv2 and fails
+# against these instances.
+curl -fsSL --retry 5 https://awscli.amazonaws.com/awscli-exe-linux-aarch64.zip -o /tmp/awscliv2.zip
+unzip -q /tmp/awscliv2.zip -d /tmp
+/tmp/aws/install --update
+rm -rf /tmp/awscliv2.zip /tmp/aws
+
+progress "aws cli installed"
+
+# Explicit cgroupDriver so kubelet does not have to infer it and drift from
+# containerd's SystemdCgroup=true.
+cat > /etc/default/kubelet <<'KUBELET'
+KUBELET_CONFIG_ARGS="--config=/var/lib/kubelet/config.yaml"
+KUBELET_KUBECONFIG_ARGS="--bootstrap-kubeconfig=/etc/kubernetes/bootstrap-kubelet.conf --kubeconfig=/etc/kubernetes/kubelet.conf"
+KUBELET_CERTIFICATE_ARGS="--rotate-certificates=true"
+KUBELET_CGROUP_ARGS="--cgroup-driver=systemd"
+KUBELET_LOGGING_ARGS="--v=2"
+KUBELET_EXTRA_ENVS="KUBELET_EXTRA_ARGS"
+KUBELET_POD_MANIFEST_PATH=/etc/kubernetes/manifests
+KUBELET_FEATURE_GATES="RotateKubeletServerCertificate=true"
+KUBELET_TLS_CIPHER_SUITES="TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305,TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305,TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384"
+KUBELET
+
+# No bootstrap-time CRI flags here: /etc/default/kubelet is sourced on every
+# start, so they would fight the kubeadm-written config after the node joins.

@@ -1,0 +1,10 @@
+{
+  "severity_overrides": {
+    "aws-cloudfront-enforce-https": "MEDIUM",
+    "aws-cloudfront-enable-logging": "LOW",
+    "aws-ec2-enable-at-rest-encryption": "MEDIUM"
+  },
+  "exclude_downloaded_modules": true,
+  "no_colour": true,
+  "minimum_severity": "MEDIUM"
+}

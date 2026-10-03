@@ -1,0 +1,129 @@
+# ---------------------------------------------------------------------------
+# Traefik - the only ingress path.
+# ---------------------------------------------------------------------------
+# NodePort 30080, because that is what the ALB target group targets (see
+# infra/modules/edge). Not LoadBalancer and not ClusterIP: a LoadBalancer service
+# would provision a second, more expensive load balancer and quietly become the
+# real entry point, and the ALB would sit in front of nothing.
+#
+# The health check is the part that is easy to get wrong. The ALB requests
+# /ping on the traffic port, so Traefik has to answer /ping on the web entrypoint.
+# Traefik 3 does that with `entryPoints.traefik.ping.entryPoint: traefik`, which
+# serves the ping endpoint on the web entrypoint instead of a separate one.
+# Two NodePorts cannot share a number, so giving ping its own entrypoint would
+# force the ALB to target a port it cannot also use for real traffic.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: traefik
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+
+  source:
+    repoURL: https://argoproj.github.io/argo-helm
+    chart: traefik
+    targetRevision: 41.4.0
+    helm:
+      releaseName: traefik
+      values: |
+        # Namespace is created by the Application's destination + CreateNamespace
+        # rather than by the chart, so Argo CD owns it and can prune it.
+        fullnameOverride: traefik
+
+        image:
+          # The chart's default tag tracks the chart release. Pinning it means a
+          # chart bump that silently changes the running image shows up in a diff.
+          tag: v3.6.2
+
+        service:
+          type: NodePort
+          nodePort:
+            http: 30080
+          # The chart creates a ClusterIP service alongside the NodePort service.
+          # One is enough: the ALB and the nodes both reach the NodePort.
+          annotations: {}
+
+        ports:
+          web:
+            port: 8080
+            expose:
+              default: true
+            nodePort: 30080
+          ping:
+            port: 8082
+            # Not exposed as its own NodePort. It is reachable at /ping on the web
+            # entrypoint, which is what the ALB health check uses.
+            expose:
+              default: false
+            nodePort: null
+
+        entryPoints:
+          traefik:
+            address: ":8080"
+            ping:
+              # Serve /ping on the web entrypoint so one NodePort serves both
+              # traffic and health checks.
+              entryPoint: traefik
+
+        # No dashboard, no metrics endpoint, no ingressClass controller watching.
+        # The dashboard would be an admin UI on a NodePort for no benefit in a
+        # throwaway environment, and the spec does not ask for it.
+        dashboard:
+          enabled: false
+        metrics:
+          prometheus:
+            enabled: false
+
+        providers:
+          kubernetesCrd:
+            enabled: true
+          kubernetesIngress:
+            enabled: false
+          kubernetesGateway:
+            enabled: false
+
+        # Lets a project namespace create IngressRoutes. Without this Traefik's
+        # RBAC does not let it watch other namespaces, which is where the project
+        # IngressRoutes live.
+        rbac:
+          namespaces: true
+
+        # Controllers must tolerate the control plane: with taint-based eviction
+        # the control-plane node is a real place workloads can land, and Traefik
+        # refusing to schedule there would leave the cluster ingressless whenever
+        # the single worker is busy.
+        tolerations:
+          - operator: Exists
+        nodeSelector:
+          kubernetes.io/os: linux
+
+        resources:
+          requests:
+            cpu: 50m
+            memory: 128Mi
+          limits:
+            memory: 256Mi
+
+        # The chart creates a ServiceAccount, ClusterRole and ClusterRoleBinding.
+        # Argo CD skips its own prune of these unless told otherwise, so the
+        # comparison options are explicit rather than left to defaults.
+        serviceAccount:
+          create: true
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: traefik
+
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true
+      # The chart's RBAC objects must survive a prune of everything else; without
+      # this, a bad sync can delete the ClusterRole that lets Traefik watch
+      # namespaces, and Traefik then silently stops routing while still Running.
+      - RespectIgnoreDifferences=true

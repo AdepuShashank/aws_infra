@@ -1,0 +1,37 @@
+# Checkov configuration
+# https://www.checkov.io/2.Basics/Configuration.html
+---
+directory:
+  - infra
+
+framework:
+  - terraform
+
+download-external-modules: false
+
+# Secrets are never committed; an allowlist is cheaper to maintain than an
+# exhaustive deny-list while the repository is still small.
+skip-path:
+  - infra/modules/.gitkeep
+  - infra/modules/README.md
+  - infra/envs/.gitkeep
+
+# Checks we knowingly accept. Each entry states why.
+skip-check:
+  # CKV_AWS_18 - S3 access logging. We use CloudTrail data events + bucket
+  # policy denial logging instead; access logging is an optional toggle.
+  - CKV_AWS_18
+  # CKV_AWS_186 - multi-region DR. Out of scope: single-region, throwaway envs.
+  - CKV_AWS_186
+  # CKV_AWS_255 - VPC flow logs. Optional per spec (flow_logs_enabled toggle).
+  - CKV_AWS_255
+  # CKV_AWS_16 - public ALB. Intentional; restricted via allowed_cidrs, no WAF by design.
+  - CKV_AWS_16
+  # CKV_AWS_19 - S3 SSE with KMS. State bucket uses a dedicated key but the
+  # check requires a customer-managed key on every bucket including logs.
+  - CKV_AWS_19
+
+output-format: cli
+compact: true
+quiet: false
+soft-fail: false

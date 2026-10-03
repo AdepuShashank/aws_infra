@@ -1,0 +1,111 @@
+#!/usr/bin/env bash
+# ---------------------------------------------------------------------------
+# Worker bootstrap: common node setup, then wait for a join command and join.
+# ---------------------------------------------------------------------------
+# cloud-init runs one user-data payload, so the shared node bootstrap is inlined
+# ahead of the worker half by Terraform. Never name the interpolation variable in
+# a comment here: templatefile expands dollar-brace expressions inside comments
+# too, which once pasted a second copy of the shared bootstrap in and left a bare
+# "." line that bash executed as `source` with no argument.
+#
+# The worker never runs kubeadm init. It polls SSM for the join command the
+# control plane publishes, then joins with it.
+#
+# The polling loop matters. A worker can boot before the control plane has
+# finished kubeadm init, or while a token refresh is mid-flight. Exiting non-zero
+# in that case makes the ASG replace the instance, which then loses the same race
+# again. Waiting in place is correct: the instance is otherwise healthy and will
+# join as soon as the control plane is ready.
+
+set -euxo pipefail
+
+export DEBIAN_FRONTEND=noninteractive
+
+${common}
+
+log() { echo "[k8s-worker] $*"; }
+
+REGION=${region}
+JOIN_SSM=${ssm_join_command}
+MAX_WAIT_SECONDS=${max_wait_seconds}
+
+aws configure set region "$REGION"
+
+# 45 minutes by default: enough for a cold t4g.medium control plane to complete
+# kubeadm init plus container image pulls on first boot, and short enough that a
+# genuinely broken cluster does not hold an instance out of service indefinitely.
+log "waiting for join command at $JOIN_SSM (max $MAX_WAIT_SECONDS seconds)"
+
+JOIN_CMD=""
+ENDPOINT=""
+TOKEN=""
+CA_HASH=""
+DEADLINE=$(( $(date +%s) + MAX_WAIT_SECONDS ))
+
+# Parsing happens inside the loop, and a command that does not parse counts as
+# "not ready" rather than as a failure. The control plane rewrites the parameter
+# on every token refresh, so a worker can read it mid-write; and a parameter
+# that parses but carries an empty token is exactly what a broken publisher
+# leaves behind. Both look identical from here and neither is worth killing the
+# instance over - exiting non-zero makes the ASG launch a replacement that reads
+# the same value and loses the same race.
+#
+# Parse rather than eval. The value is a SecureString parameter this instance's
+# own role wrote, so it is not attacker-controlled, but kubeadm join does not take
+# a prebuilt command line, so the pieces have to come apart anyway.
+while [ "$(date +%s)" -lt "$DEADLINE" ]; do
+  JOIN_CMD="$(aws ssm get-parameter \
+    --name "$JOIN_SSM" \
+    --with-decryption \
+    --query 'Parameter.Value' \
+    --output text \
+    --region "$REGION" 2>/dev/null || true)"
+
+  if [ -n "$JOIN_CMD" ] && [ "$JOIN_CMD" != "None" ] && [ "$JOIN_CMD" != "null" ]; then
+    CANDIDATE_ENDPOINT="$(echo "$JOIN_CMD" | sed -n 's/^kubeadm join \([^ ]*\).*/\1/p')"
+    CANDIDATE_TOKEN="$(echo "$JOIN_CMD" | sed -n 's/.*--token \([^ ]*\).*/\1/p')"
+    CANDIDATE_CA_HASH="$(echo "$JOIN_CMD" | sed -n 's/.*--discovery-token-ca-cert-hash \([^ ]*\).*/\1/p')"
+
+    if [ -n "$CANDIDATE_ENDPOINT" ] && [ -n "$CANDIDATE_TOKEN" ] && [ -n "$CANDIDATE_CA_HASH" ]; then
+      ENDPOINT="$CANDIDATE_ENDPOINT"
+      TOKEN="$CANDIDATE_TOKEN"
+      CA_HASH="$CANDIDATE_CA_HASH"
+      log "got join command for $ENDPOINT"
+      break
+    fi
+
+    log "join command at $JOIN_SSM is incomplete, retrying in 15s"
+  else
+    log "join command not available yet, retrying in 15s"
+  fi
+
+  sleep 15
+done
+
+if [ -z "$ENDPOINT" ] || [ -z "$TOKEN" ] || [ -z "$CA_HASH" ]; then
+  log "ERROR: no usable join command after $MAX_WAIT_SECONDS seconds"
+  log "check that the control plane finished kubeadm init, that k8s-join-token.timer is running,"
+  log "and that the join-command parameter holds a command with a non-empty --token"
+  exit 1
+fi
+
+log "joining $ENDPOINT"
+# The endpoint is a POSITIONAL argument: `kubeadm join <api-server-endpoint>`. There
+# is no --control-plane-endpoint flag - that one only exists on `kubeadm init`, and
+# `kubeadm join` rejects it with "unknown flag" (kubeadm 1.36).
+#
+# Omitting the positional argument is not caught as a missing endpoint either. It
+# surfaces much later as
+#   discovery: Invalid value: "": bootstrapToken or file must be set
+# which points at the token, not at the thing that is actually missing.
+#
+# --cri-socket explicit: kubeadm's autodetection prefers the Docker socket when
+# docker is present, which is not the case today but becomes a silent failure the
+# day someone adds a container runtime to the base image.
+kubeadm join "$ENDPOINT" \
+  --token "$TOKEN" \
+  --discovery-token-ca-cert-hash "$CA_HASH" \
+  --cri-socket unix:///run/containerd/containerd.sock \
+  --v=2
+
+log "worker joined the cluster"
