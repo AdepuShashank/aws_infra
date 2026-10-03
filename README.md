@@ -17,6 +17,9 @@ inside it. No EKS, no NAT Gateway, no managed RDS, no long-lived AWS keys.
 | State | S3 backend, native lockfile (`use_lockfile`), **no DynamoDB** |
 | Access | SSM Session Manager only - no SSH, no bastion, no key pairs |
 
+> **Compute is paused for cost.** To bring it back, start with
+> [`bring_back.MD`](bring_back.MD) — it is the full handoff for a fresh session.
+
 ## Current state
 
 Phases 0-6 are applied in **prod**; both nodes are `Ready` and every platform pod
