@@ -44,7 +44,12 @@ publish_state() {
   echo "[platform-bootstrap] state: $1"
 }
 
-trap 'publish_state "failed at line $LINENO"' ERR
+# Names the failing command, not just a line number. A line number alone is close
+# to useless here: with `set -e` plus a heredoc pipeline, $LINENO routinely points
+# at the nearest comment rather than at the command that failed, which is how a
+# failure in the CRD install reported "failed at line 91" where line 91 was a
+# sentence in a comment.
+trap 'publish_state "failed (exit $?): $BASH_COMMAND"' ERR
 
 publish_state "starting"
 
@@ -82,29 +87,40 @@ done
 # and an IP pool that no node is using.
 #
 # kubectl create, not apply, for the CRDs: the bundle is ~3 MB and apply exceeds
-# the API server's request limit. create fails harmlessly on a re-run, hence the
-# fallback.
-log "installing Calico CRDs ($CALICO_VERSION)"
-MANIFESTS="https://raw.githubusercontent.com/projectcalico/calico/$CALICO_VERSION/manifests"
+# the API server's request limit.
+#
+# The existence check is a check, not a fallback. An earlier version did
+# `create || replace --force`, and on any re-run the create failed with
+# AlreadyExists and the replace then tried to delete and recreate 3 MB of CRDs
+# that tigera-operator was actively serving - which fails, and takes the whole
+# script down with it. A CRD that already exists is the outcome this section
+# wanted, so there is nothing to do.
+if kubectl get crd installations.operator.tigera.io >/dev/null 2>&1; then
+  log "Calico already installed, skipping CNI install"
+else
+  log "installing Calico CRDs ($CALICO_VERSION)"
+  MANIFESTS="https://raw.githubusercontent.com/projectcalico/calico/$CALICO_VERSION/manifests"
 
-kubectl create -f "$MANIFESTS/v1_crd_projectcalico_org.yaml" ||
-  kubectl replace --force -f "$MANIFESTS/v1_crd_projectcalico_org.yaml"
+  kubectl create -f "$MANIFESTS/v1_crd_projectcalico_org.yaml"
 
-log "waiting for the Calico CRDs to be established"
-for i in $(seq 1 30); do
-  if kubectl get crd installations.operator.tigera.io >/dev/null 2>&1; then
-    break
-  fi
-  sleep 5
-done
+  log "waiting for the Calico CRDs to be established"
+  for i in $(seq 1 30); do
+    if kubectl get crd installations.operator.tigera.io >/dev/null 2>&1; then
+      break
+    fi
+    sleep 5
+  done
 
-log "installing the tigera operator"
-kubectl create -f "$MANIFESTS/tigera-operator.yaml" ||
-  kubectl apply -f "$MANIFESTS/tigera-operator.yaml"
+  log "installing the tigera operator"
+  kubectl create -f "$MANIFESTS/tigera-operator.yaml" ||
+    kubectl apply -f "$MANIFESTS/tigera-operator.yaml"
 
-kubectl -n tigera-operator rollout status deployment/tigera-operator --timeout=300s
+  kubectl -n tigera-operator rollout status deployment/tigera-operator --timeout=300s
+fi
 
-log "creating the Calico Installation with pod CIDR $POD_CIDR"
+# The Installation resource is applied, not created: apply is the idempotent one,
+# and this is the one object whose content must win over whatever is there.
+log "applying the Calico Installation with pod CIDR $POD_CIDR"
 cat <<EOF | kubectl apply -f -
 apiVersion: operator.tigera.io/v1
 kind: Installation
