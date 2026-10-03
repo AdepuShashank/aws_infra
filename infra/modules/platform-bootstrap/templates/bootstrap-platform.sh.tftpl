@@ -95,21 +95,40 @@ done
 # that tigera-operator was actively serving - which fails, and takes the whole
 # script down with it. A CRD that already exists is the outcome this section
 # wanted, so there is nothing to do.
-if kubectl get crd installations.operator.tigera.io >/dev/null 2>&1; then
-  log "Calico already installed, skipping CNI install"
+# The check is for the tigera-operator DEPLOYMENT, not for the CRDs.
+#
+# The CRDs and the operator are installed by separate files, and either can be
+# present without the other: a partially failed run leaves 30 CRDs and no
+# operator. Testing for the CRD instead makes that state look complete and skips
+# installing the one thing that is actually missing - which is the state this
+# cluster was in when the CRDs had been force-replaced.
+if kubectl -n tigera-operator get deployment tigera-operator >/dev/null 2>&1; then
+  log "tigera-operator already running, skipping CNI install"
 else
   log "installing Calico CRDs ($CALICO_VERSION)"
   MANIFESTS="https://raw.githubusercontent.com/projectcalico/calico/$CALICO_VERSION/manifests"
 
-  kubectl create -f "$MANIFESTS/v1_crd_projectcalico_org.yaml"
+  # Tolerated, not forced. The bundle is ~3 MB and may already be partly present;
+  # kubectl create exits non-zero for any single AlreadyExists, and under `set -e`
+  # that aborted the run with every CRD already created. Nothing here may delete:
+  # see docs/adr/0004-calico-crd-replace.md for what `replace --force` did to this
+  # cluster. The wait below is the real completion signal, not the exit code.
+  kubectl create -f "$MANIFESTS/v1_crd_projectcalico_org.yaml" >/dev/null 2>&1 || true
 
   log "waiting for the Calico CRDs to be established"
-  for i in $(seq 1 30); do
-    if kubectl get crd installations.operator.tigera.io >/dev/null 2>&1; then
+  CRD_WAIT=0
+  for i in $(seq 1 60); do
+    if kubectl get crd installations.operator.tigera.io >/dev/null 2>&1 &&
+      kubectl get crd ippools.crd.projectcalico.org >/dev/null 2>&1; then
+      CRD_WAIT=1
       break
     fi
     sleep 5
   done
+  if [ "$CRD_WAIT" != "1" ]; then
+    echo "ERROR: Calico CRDs did not become established within 5 minutes" >&2
+    exit 1
+  fi
 
   log "installing the tigera operator"
   kubectl create -f "$MANIFESTS/tigera-operator.yaml" ||
@@ -119,7 +138,12 @@ else
 fi
 
 # The Installation resource is applied, not created: apply is the idempotent one,
-# and this is the one object whose content must win over whatever is there.
+# and this is the one object whose content must win over whatever is there. It is
+# also the source of the pod CIDR, which must match what kubeadm was given.
+#
+# Waited on explicitly before going further. The IPPool is created by the operator
+# reconciling this object, so "the CRDs exist" and "pods can get an IP" are
+# different moments, and only the second one matters.
 log "applying the Calico Installation with pod CIDR $POD_CIDR"
 cat <<EOF | kubectl apply -f -
 apiVersion: operator.tigera.io/v1
@@ -136,6 +160,22 @@ spec:
         natOutgoing: Enabled
         nodeSelector: all()
 EOF
+
+log "waiting for the Calico IP pool to be created"
+POOL_WAIT=0
+for i in $(seq 1 60); do
+  if kubectl get ippool default-ipv4-ippool -o jsonpath='{.spec.cidr}' 2>/dev/null | grep -q "$POD_CIDR"; then
+    POOL_WAIT=1
+    break
+  fi
+  sleep 5
+done
+if [ "$POOL_WAIT" != "1" ]; then
+  echo "ERROR: Calico did not create an IPPool for $POD_CIDR within 5 minutes." >&2
+  echo "Check that the tigera-operator is Running and can write operator CRs." >&2
+  exit 1
+fi
+log "IP pool ready"
 
 log "waiting for the Calico daemonset to roll out"
 for i in $(seq 1 90); do
@@ -160,38 +200,95 @@ publish_state "calico-installed"
 # Installed here rather than in cloud-init because Phase 6 is the first thing that
 # needs it and Phase 4 has no reason to carry a ~50 MB download. The checksum is
 # verified, so the download is pinned to this exact artifact rather than to a URL.
-log "installing helm $HELM_VERSION"
-case "$(uname -m)" in
-  aarch64 | arm64) HELM_ARCH=arm64 ;;
-  x86_64) HELM_ARCH=amd64 ;;
-  *)
-    log "ERROR: unsupported architecture $(uname -m)"
-    exit 1
-    ;;
-esac
+# Helm is installed once and then left alone. Re-downloading ~50 MB on every
+# scheduled association run is pointless, and the download-then-extract path is the
+# flakiest step in this script - one run failed at `tar -xzf` with a perfectly good
+# tarball and 23 GB free, which is not a diagnosable failure.
+#
+# The version is compared rather than just testing -e, so bumping helm_version
+# still installs the new one. `helm version --short` prints "v3.20.0+gb2e4314";
+# the build metadata is stripped before comparing.
+log "checking for helm $HELM_VERSION"
+install_helm=false
+if [ -x /usr/local/bin/helm ]; then
+  INSTALLED_HELM="$(/usr/local/bin/helm version --short 2>/dev/null | sed 's/+.*//')"
+  if [ "$INSTALLED_HELM" = "v$HELM_VERSION" ]; then
+    log "helm $HELM_VERSION already installed, skipping"
+  else
+    log "helm $INSTALLED_HELM present, replacing with $HELM_VERSION"
+    install_helm=true
+  fi
+else
+  install_helm=true
+fi
 
-HELM_TARBALL="helm-v$HELM_VERSION-linux-$HELM_ARCH.tar.gz"
-curl -fsSL --retry 5 "https://get.helm.sh/$HELM_TARBALL" -o "/tmp/$HELM_TARBALL"
+if [ "$install_helm" = "true" ]; then
+  case "$(uname -m)" in
+    aarch64 | arm64) HELM_ARCH=arm64 ;;
+    x86_64) HELM_ARCH=amd64 ;;
+    *)
+      log "ERROR: unsupported architecture $(uname -m)"
+      exit 1
+      ;;
+  esac
 
-# The published sha256sum file names the file it belongs to; the first field is
-# the digest, which is the only part compared here.
-REMOTE_SHA="$(curl -fsSL --retry 5 "https://get.helm.sh/$HELM_TARBALL.sha256sum" | awk '{print $1}')"
-echo "$REMOTE_SHA  /tmp/$HELM_TARBALL" | sha256sum -c - >/dev/null ||
-  { log "ERROR: helm checksum mismatch (expected $HELM_SHA256)"; exit 1; }
+  HELM_TARBALL="helm-v$HELM_VERSION-linux-$HELM_ARCH.tar.gz"
+  rm -rf "/tmp/$HELM_TARBALL" "/tmp/linux-$HELM_ARCH"
 
-tar -xzf "/tmp/$HELM_TARBALL" -C /tmp
-install -m 0755 "/tmp/linux-$HELM_ARCH/helm" /usr/local/bin/helm
-rm -rf "/tmp/$HELM_TARBALL" "/tmp/linux-$HELM_ARCH"
+  curl -fsSL --retry 5 "https://get.helm.sh/$HELM_TARBALL" -o "/tmp/$HELM_TARBALL"
 
-# helm's own state and cache belong on disk, not in $HOME, which is read-only-ish
-# and not predictable under systemd.
+  # The published sha256sum file names the file it belongs to; the first field is
+  # the digest, which is the only part compared here.
+  REMOTE_SHA="$(curl -fsSL --retry 5 "https://get.helm.sh/$HELM_TARBALL.sha256sum" | awk '{print $1}')"
+  echo "$REMOTE_SHA  /tmp/$HELM_TARBALL" | sha256sum -c - >/dev/null ||
+    { log "ERROR: helm checksum mismatch (expected $HELM_SHA256)"; exit 1; }
+
+  tar -xzf "/tmp/$HELM_TARBALL" -C /tmp ||
+    { log "ERROR: could not extract $HELM_TARBALL"; exit 1; }
+  install -m 0755 "/tmp/linux-$HELM_ARCH/helm" /usr/local/bin/helm
+  rm -rf "/tmp/$HELM_TARBALL" "/tmp/linux-$HELM_ARCH"
+fi
+
+# helm's own state and cache belong on disk, not in $HOME, which is not predictable
+# under systemd and may not be writable.
 export HELM_CACHE_HOME=/var/cache/helm
 export HELM_CONFIG_HOME=/var/lib/helm
 export HELM_DATA_HOME=/var/lib/helm
 mkdir -p "$HELM_CACHE_HOME" "$HELM_CONFIG_HOME" "$HELM_DATA_HOME"
 
-helm repo add argo https://argoproj.github.io/argo-helm
-helm repo update
+# Clear a release stuck mid-upgrade.
+#
+# When a `helm upgrade` fails - here because `--wait` timed out on a repo-server
+# that could not pass its probe - Helm leaves a release Secret with status
+# pending-upgrade. Every subsequent upgrade then fails immediately with
+# "another operation (install/upgrade/rollback) is in progress" and does no work
+# at all, so one timed-out run permanently wedges every later run.
+#
+# Deleting only the *pending* Secret is deliberate. `helm rollback argocd 0`
+# would also work but it uninstalls the release first, so a retry would have to
+# recreate the CRDs too. The deployed release's Secret is left alone.
+PENDING_SECRETS=0
+PENDING_SECRETS="$(kubectl -n argocd get secret \
+  -l owner=helm,name=argocd \
+  -o jsonpath="{range .items[?(@.metadata.labels.status)]}{.metadata.labels.status}{'\n'}{end}" 2>/dev/null |
+  grep -c '^pending' || true)"
+
+if [ "$PENDING_SECRETS" != "0" ]; then
+  log "clearing a stuck pending Argo CD release ($PENDING_SECRETS secret(s))"
+  # By label, not by field selector. The Secret's *type* is helm.sh/release.v1
+  # for every revision including pending ones - pending is a label, so a
+  # field-selector on type=...pending-upgrade matches nothing and silently leaves
+  # the wedge in place while appearing to do the job.
+  kubectl -n argocd delete secret \
+    -l owner=helm,name=argocd,status=pending-upgrade 2>/dev/null || true
+  kubectl -n argocd delete secret \
+    -l owner=helm,name=argocd,status=pending-install 2>/dev/null || true
+  kubectl -n argocd delete secret \
+    -l owner=helm,name=argocd,status=pending-rollback 2>/dev/null || true
+fi
+
+helm repo add argo https://argoproj.github.io/argo-helm --force-update >/dev/null 2>&1 || true
+helm repo update >/dev/null 2>&1 || true
 
 # ---------------------------------------------------------------------------
 # Argo CD
@@ -199,6 +296,11 @@ helm repo update
 # ClusterIP only. The spec's "not publicly exposed" is load-bearing: an Argo CD
 # server reachable from the internet is an unauthenticated GitOps control plane
 # with cluster-admin behind it, and the admin password lives in a Secret.
+#
+# No --wait. helm's --wait blocks on every deployment becoming Available, and the
+# repo-server's probe as shipped by the chart cannot pass on this cluster (see
+# below) - so waiting inside helm means never reaching the code that fixes it.
+# The rollout waits are explicit and come after the probe is corrected.
 log "installing Argo CD (chart $ARGOCD_CHART_VERSION)"
 helm upgrade --install argocd argo/argo-cd \
   --version "$ARGOCD_CHART_VERSION" \
@@ -211,14 +313,32 @@ helm upgrade --install argocd argo/argo-cd \
   --set controller.repoServer.parallelismLimit=2 \
   --set controller.operation.processors.num=2 \
   --set controller.status.processors.num=2 \
-  --set controller.application.resourceTrackingMethod=annotation \
   --set redis-ha.enabled=false \
   --set timeout.replication=60s \
-  --wait \
-  --timeout 15m
+  --timeout 10m
 
-kubectl -n argocd rollout status deployment/argocd-server --timeout=600s
-kubectl -n argocd rollout status deployment/argocd-repo-server --timeout=600s
+# The chart gives repo-server `GET /healthz?full=true` as BOTH its readiness and
+# liveness probe, with `timeoutSeconds: 1`. The `full=true` variant is not a
+# health check - it clones every configured repository and confirms the result.
+#
+# On a single-worker cluster where a cold git fetch takes more than a second, that
+# is a liveness probe that measures the network rather than the process. Observed:
+# 18 restarts of a container that was working, each one restarting the git fetch
+# it had not finished. Making it a liveness probe that does no I/O is the fix; the
+# expensive variant is what belongs on readiness, and even there it is left at the
+# chart default below because a 10s timeout is enough for it on a warm cache.
+log "correcting the repo-server probes"
+kubectl -n argocd patch deployment argocd-repo-server --type=json -p='[
+  {"op":"replace","path":"/spec/template/spec/containers/0/livenessProbe/httpGet/path","value":"/healthz"},
+  {"op":"replace","path":"/spec/template/spec/containers/0/livenessProbe/timeoutSeconds","value":15},
+  {"op":"replace","path":"/spec/template/spec/containers/0/readinessProbe/httpGet/path","value":"/healthz"},
+  {"op":"replace","path":"/spec/template/spec/containers/0/readinessProbe/timeoutSeconds","value":15}
+]' >/dev/null
+
+for d in argocd-server argocd-repo-server argocd-redis; do
+  kubectl -n argocd rollout status "deployment/$d" --timeout=600s
+done
+kubectl -n argocd rollout status statefulset/argocd-application-controller --timeout=600s
 
 log "waiting for the Argo CD API to answer"
 for i in $(seq 1 60); do
