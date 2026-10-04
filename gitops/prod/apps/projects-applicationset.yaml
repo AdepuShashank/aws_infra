@@ -16,21 +16,29 @@ metadata:
   namespace: argocd
 spec:
   goTemplate: true
-  # goTemplateOptions is a LIST of {key, value} pairs, not a map. The CRD schema is
-  # authoritative here and the error is unambiguous:
+  # goTemplateOptions is a list of STRINGS, and this took three forms to find:
   #
-  #   .spec.goTemplateOptions: expected list, got &{}
+  #   missingkey: error
+  #     -> .spec.goTemplateOptions: expected list, got &{}
+  #   - key: missingkey
+  #     value: error
+  #     -> .spec.goTemplateOptions[0]: expected string, got &value.valueUnstructured{...}
+  #   - "missingkey=error"                          <- this one
   #
-  # A map happens to be what every other part of this repository uses, which is
-  # exactly why it is worth spelling out. Under server-side apply the API server
-  # validates against the CRD's structural schema and rejects it outright, so this
-  # is not a style preference - the map form has never worked.
+  # The CRD is the authority and it is worth reading rather than recalling. On this
+  # cluster (Argo CD v3.5.3):
+  #
+  #   kubectl get crd applicationsets.argoproj.io \
+  #     -o jsonpath='{.spec.versions[0].schema.openAPIV3Schema.properties.spec.properties.goTemplateOptions}'
+  #   {"items":{"type":"string"},"type":"array"}
+  #
+  # Each wrong form produces a different error from the API server and every one of
+  # them fails the ROOT sync, not just this ApplicationSet.
   goTemplateOptions:
     # Missing keys are a render failure. Silently producing "" for a namespace
     # would create an Application that targets nothing and reports itself
     # OutOfSync against an empty path.
-    - key: missingkey
-      value: error
+    - "missingkey=error"
 
   generators:
     - list:
