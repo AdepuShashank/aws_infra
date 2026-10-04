@@ -466,12 +466,18 @@ log "creating the root Application pointing at $EFFECTIVE_REPO_URL:$GITOPS_REPO_
 # thing that points at projects/scaffold, and it sets its own destination namespace
 # per project.
 #
-# apps/shared-postgres/** is excluded from the other direction. Its manifests are
-# plain Kubernetes objects rather than an Application, so the root app would apply
-# them into the argocd namespace while the Application that owns them applies them
-# into data. Two owners for one object means self-heal fighting prune, and the loser
-# is whichever one you were not looking at. Every directory under apps/ that holds
-# real manifests needs its own entry here.
+# apps/shared-postgres/** and apps/secret-store/** are excluded from the other
+# direction. Their manifests are plain Kubernetes objects rather than Applications,
+# so the root app would apply them into the argocd namespace while the Application
+# that owns them applies them into data. Two owners for one object means self-heal
+# fighting prune, and the loser is whichever one you were not looking at. Every
+# directory under apps/ that holds real manifests needs its own entry here.
+#
+# The secret-store exclusion has a second, harder reason, spelled out at the top of
+# gitops/<env>/apps/secret-store.yaml: a ClusterSecretStore is a CRD installed by
+# another Application in this same directory, and Argo CD cannot generate manifests
+# for the root app at all while that CRD is unregistered. Leaving it in scope fails
+# the root sync, and the root sync is what creates everything else.
 #
 # The braces are required: Argo CD parses this as a comma-separated brace group, and
 # a single unbraced pattern containing a slash behaves differently.
@@ -491,7 +497,7 @@ spec:
     path: $GITOPS_REPO_PATH
     directory:
       recurse: true
-      exclude: '{projects/**,apps/shared-postgres/**,*.md}'
+      exclude: '{projects/**,apps/shared-postgres/**,apps/secret-store/**,*.md}'
   destination:
     server: https://kubernetes.default.svc
     namespace: argocd
