@@ -54,6 +54,29 @@ spec:
           # no pin, because it looks deliberate.
           tag: v3.7.13
 
+        # No entryPoints block. In chart 41.x an entrypoint is generated from each
+        # entry in `ports`, so the previous top-level entryPoints map was rejected by
+        # the schema. The two ports below are the two that matter:
+        #
+        #   web     the traffic port, and the one the ALB targets. nodePort must equal
+        #           traefik_http_nodeport in 40-edge and traefik_nodeports in
+        #           20-security, or the ALB health check has nothing to talk to.
+        #   traefik the ping port, expose.default false so it gets no Service of its
+        #           own. The chart's default already serves /ping here, which is what
+        #           lets one NodePort serve both traffic and health checks - a second
+        #           NodePort would have to be a number the ALB is not using.
+        ports:
+          web:
+            port: 8080
+            expose:
+              default: true
+            nodePort: 30080
+          traefik:
+            port: 8080
+            expose:
+              default: false
+            nodePort: null
+
         service:
           type: NodePort
           nodePort:
@@ -62,55 +85,43 @@ spec:
           # One is enough: the ALB and the nodes both reach the NodePort.
           annotations: {}
 
-        ports:
-          web:
-            port: 8080
-            expose:
-              default: true
-            nodePort: 30080
-          ping:
-            port: 8082
-            # Not exposed as its own NodePort. It is reachable at /ping on the web
-            # entrypoint, which is what the ALB health check uses.
-            expose:
-              default: false
-            nodePort: null
-
-        entryPoints:
-          traefik:
-            address: ":8080"
-            ping:
-              # Serve /ping on the web entrypoint so one NodePort serves both
-              # traffic and health checks.
-              entryPoint: traefik
-
         # No dashboard, no metrics endpoint, no ingressClass controller watching.
         # The dashboard would be an admin UI on a NodePort for no benefit in a
         # throwaway environment, and the spec does not ask for it.
-        dashboard:
-          enabled: false
+        #
+        # In chart 41.x the dashboard is api.dashboard, not a top-level `dashboard` -
+        # the previous version of this file set `dashboard.enabled`, which the schema
+        # rejects with "at '': additional properties 'entryPoints', 'dashboard' not
+        # allowed".
+        api:
+          dashboard: false
+
         metrics:
           prometheus:
             enabled: false
 
         providers:
-          kubernetesCrd:
+          # kubernetesCRD, capital RD. `kubernetesCrd` was rejected by the schema,
+          # and a silently-ignored provider here would mean no IngressRoutes and no
+          # error - just a Traefik that is Running and routes nothing.
+          kubernetesCRD:
             enabled: true
           kubernetesIngress:
             enabled: false
           kubernetesGateway:
             enabled: false
 
-        # Lets a project namespace create IngressRoutes. Without this Traefik's
-        # RBAC does not let it watch other namespaces, which is where the project
-        # IngressRoutes live.
+        # Lets Traefik watch every namespace, which is where the project IngressRoutes
+        # live. `namespaced: true` in chart 41.x - the old `rbac.namespaces` key is
+        # rejected. Without it Traefik's RBAC does not let it read other namespaces,
+        # and it goes Running while silently routing nothing.
         rbac:
-          namespaces: true
+          namespaced: true
 
-        # Controllers must tolerate the control plane: with taint-based eviction
-        # the control-plane node is a real place workloads can land, and Traefik
-        # refusing to schedule there would leave the cluster ingressless whenever
-        # the single worker is busy.
+        # Controllers must tolerate the control plane: with taint-based eviction the
+        # control-plane node is a real place workloads can land, and Traefik refusing
+        # to schedule there would leave the cluster ingressless whenever the single
+        # worker is busy.
         tolerations:
           - operator: Exists
         nodeSelector:
@@ -121,13 +132,19 @@ spec:
             cpu: 50m
             memory: 128Mi
           limits:
+            # No CPU limit, same reasoning as the CSI controller: this is a latency-
+            # sensitive data path and a CPU cap turns a burst into dropped requests.
             memory: 256Mi
 
-        # The chart creates a ServiceAccount, ClusterRole and ClusterRoleBinding.
-        # Argo CD skips its own prune of these unless told otherwise, so the
-        # comparison options are explicit rather than left to defaults.
-        serviceAccount:
-          create: true
+        # No serviceAccount block. In chart 41.x the only key is `name`, and the
+        # chart always creates the ServiceAccount, ClusterRole and ClusterRoleBinding -
+        # there is no `create: false` to set, so the previous `serviceAccount.create`
+        # was rejected by the schema rather than doing anything.
+        #
+        # The chart's RBAC objects do need to survive a prune of everything else;
+        # without RespectIgnoreDifferences below, a bad sync can delete the ClusterRole
+        # that lets Traefik watch namespaces, and Traefik then goes on Running while
+        # routing nothing.
   destination:
     server: https://kubernetes.default.svc
     namespace: traefik
