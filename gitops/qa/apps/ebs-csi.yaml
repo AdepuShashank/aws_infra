@@ -4,6 +4,34 @@
 # Wave 1: nothing can create a PersistentVolumeClaim before the driver exists, so
 # this is the first app in the sync order. Traefik's PVCs are the usual first
 # casualty of getting this wrong.
+#
+# This file is ONE document on purpose, and getting here took three attempts worth
+# recording. The StorageClass used to be a second document in this file, which put it
+# in the root Application's recursive walk as well as in this Application's scope. Two
+# consequences, both of which block the entire platform rather than just this app:
+#
+#   * the root Application applies it with ServerSideApply, and StorageClass has no
+#     structural schema, so root's sync died with
+#       failed to create typed patch object (/ebs-sc; storage.k8s.io/v1,
+#       Kind=StorageClass): .spec: field not declared in schema
+#   * a VolumeSnapshotClass was briefly added here too, using
+#     snapshot.storage.k8s.io/v1 - CRDs kubeadm does not install and nothing here
+#     installs - and root's manifest GENERATION then failed with
+#       failed to discover server resources for group version
+#       snapshot.storage.k8s.io/v1
+#
+# In an app-of-apps, root's sync is what creates every child Application. One bad
+# document in one file takes down Traefik, the CSI driver, metrics-server, CNPG and
+# the ten project namespaces with it, while each of them reports its own status as
+# perfectly healthy.
+#
+# The StorageClass is therefore declared through the chart's own `storageClasses`
+# values, which is the mechanism the chart provides and which keeps this file to a
+# single Application. There is deliberately no VolumeSnapshotClass: the postgres
+# backup path is a scheduled pg_dump, not a volume snapshot, because CloudNativePG's
+# S3 backup wants long-lived AWS keys and this account has none by design. If volume
+# snapshots are ever wanted, the snapshot.storage.k8s.io CRDs and a controller have to
+# be installed first - see gitops/<env>/apps/shared-postgres/.
 apiVersion: argoproj.io/v1alpha1
 kind: Application
 metadata:
@@ -28,12 +56,12 @@ spec:
     # 2026-10-04, where the newest is chart 2.66.0 = driver 1.66.0.
     #
     # Every key below was read out of that chart's own values.schema.json rather than
-    # remembered. The previous version of this file used controller.image,
+    # remembered. An earlier version of this file used controller.image,
     # controller.volumePermissionsFeature and a top-level daemonset block, none of which
-    # the schema allows:
+    # that schema allows:
     #
     #   at '/controller': additional properties 'image', 'volumePermissionsFeature'
-    #   not allowed
+    #     not allowed
     #   at '': additional properties 'daemonset' not allowed
     #
     # The image is top-level in this chart, the DaemonSet is configured under `node`,
@@ -54,19 +82,19 @@ spec:
           tag: v1.64.0
 
         controller:
-          # The controller is a Deployment. One replica is the chart default and is
-          # enough here; this cluster exists to prove the storage path works, not to
-          # survive a controller restart without a gap in provisioning.
+          # One replica: the chart default, and enough here. This cluster exists to
+          # prove the storage path works, not to survive a controller restart without a
+          # gap in provisioning.
           replicaCount: 1
           resources:
             requests:
               cpu: 25m
               memory: 64Mi
             limits:
-              # A memory limit and no CPU limit, deliberately. This is a control-plane
-              # component that should never be the reason a node runs out of CPU; it
-              # does need a memory ceiling so a leak is a restart rather than a node
-              # eviction that takes everything else with it.
+              # A memory ceiling and no CPU limit. This is a control-plane component
+              # that should never be the reason a node runs out of CPU, but it does
+              # need a memory bound so a leak is a restart rather than a node eviction
+              # that takes everything else with it.
               memory: 256Mi
           serviceAccount:
             annotations:
@@ -84,8 +112,8 @@ spec:
               eks.amazonaws.com/role-arn: arn:aws:iam::580857072251:role/dpx-qa-node-role
 
         # The node DaemonSet is configured under `node`, not a top-level `daemonset`.
-        # `enableWindows: false` because this cluster is Linux-only, and leaving it on
-        # renders a Windows DaemonSet that can never schedule.
+        # enableWindows has to be false, or the chart renders a Windows DaemonSet that
+        # can never schedule on a Linux-only cluster.
         node:
           enableWindows: false
           resources:
@@ -105,6 +133,34 @@ spec:
         # overriding them here is how a driver ends up running a csi-provisioner that
         # predates the driver it talks to.
 
+        # ---------------------------------------------------------------- storage
+        # gp3 rather than the chart's gp2 default: this is a cost-lean environment and
+        # gp2 costs more per GB and is slower.
+        #
+        # encrypted: true, so every volume the driver provisions is encrypted with the
+        # account's EBS KMS key - the same key 30-cluster uses for node root volumes.
+        # The key is not named here because the driver resolves encrypted volumes
+        # through the account default, and this account has exactly one EBS CMK
+        # (verified with `aws kms list-aliases`).
+        #
+        # Delete rather than Retain: these environments are torn down often, and Retain
+        # leaves a volume behind on every teardown with nothing left to manage it.
+        #
+        # The chart renders each entry here verbatim into a StorageClass, setting the
+        # provisioner itself, and defaults volumeBindingMode to WaitForFirstConsumer.
+        storageClasses:
+          - name: ebs-sc
+            annotations:
+              storageclass.kubernetes.io/is-default-class: "true"
+            type: gp3
+            reclaimPolicy: Delete
+            volumeBindingMode: WaitForFirstConsumer
+            allowVolumeExpansion: true
+            parameters:
+              type: gp3
+              encrypted: "true"
+              fsType: ext4
+
   destination:
     server: https://kubernetes.default.svc
     namespace: kube-system
@@ -116,8 +172,8 @@ spec:
     syncOptions:
       # Client-side apply for this Application, not server-side.
       #
-      # The hand-written StorageClass below is the reason, and it is not a style
-      # choice: StorageClass is one of the handful of built-in types with no structural
+      # The StorageClass above is the reason, and it is not a style choice:
+      # StorageClass is one of the handful of built-in types with no structural
       # schema, so server-side apply cannot build a typed patch for it and the sync
       # fails with
       #
@@ -134,74 +190,3 @@ spec:
       # there is no second writer to conflict with.
       - ClientSideApply=true
       - RespectIgnoreDifferences=true
-
-  ignoreDifferences:
-    # The chart's own StorageClass values are ignored because this manifest creates
-    # ebs-sc explicitly, with encryption and a gp3 type the chart defaults do not use.
-    - group: storage.k8s.io
-      kind: StorageClass
-      name: ebs-sc
-      jsonPointers:
-        - /parameters/type
-        - /reclaimPolicy
-        - /parameters/encrypted
-        - /allowVolumeExpansion
-
----
-# The default StorageClass. Written by hand rather than taken from the chart
-# because the two things that matter here are not the chart's defaults, and because
-# this chart ships storageClasses: [] - it creates none by default:
-#
-#   type: gp3        the chart defaults to gp2, which costs more per GB and is
-#                    slower. This is a cost-lean environment.
-#   encrypted: true  every volume the CSI driver creates should be encrypted with the
-#                    account's EBS KMS key, matching what 30-cluster does for node root
-#                    volumes. The key itself is not named here: the driver uses the
-#                    account default for encrypted volumes, which is the same key,
-#                    because this account has exactly one EBS CMK (verified with
-#                    `aws kms list-aliases`) and encryption happens through the node
-#                    role's IRSA grant.
-apiVersion: storage.k8s.io/v1
-kind: StorageClass
-metadata:
-  name: ebs-sc
-  annotations:
-    storageclass.kubernetes.io/is-default-class: "true"
-spec:
-  provisioner: ebs.csi.aws.com
-  type: gp3
-  encrypted: "true"
-  # Delete, not Retain. These are disposable environments that are torn down often; a
-  # Retain policy would leave volumes behind on every teardown with nothing left to
-  # manage them.
-  reclaimPolicy: Delete
-  volumeBindingMode: WaitForFirstConsumer
-  allowVolumeExpansion: true
-  parameters:
-    type: gp3
-    encrypted: "true"
-    fsType: ext4
-
----
-# A VolumeSnapshotClass, because the aws-ebs-csi-driver chart also ships
-# volumeSnapshotClasses: [] and creates none.
-#
-# Nothing uses it yet - the postgres backup path is a scheduled pg_dump, not a volume
-# snapshot, because CloudNativePG's S3 backup wants long-lived AWS keys and this
-# account has none by design. It is here so that `method: volumeSnapshot` on a
-# CloudNativePG Cluster becomes a one-line change rather than a project, and so that
-# the snapshot.storage.k8s.io CRDs have a consumer the moment they are installed.
-#
-# driver and deletionPolicy are the only required fields.
-apiVersion: snapshot.storage.k8s.io/v1
-kind: VolumeSnapshotClass
-metadata:
-  name: ebs-snapshots-gp3
-  labels:
-    app.kubernetes.io/part-of: dpx
-deleterPolicy: Delete
-driver: ebs.csi.aws.com
-deletionPolicy: Delete
-parameters:
-  type: gp3
-  encrypted: "true"
