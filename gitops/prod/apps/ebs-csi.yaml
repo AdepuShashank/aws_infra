@@ -94,6 +94,21 @@ metadata:
   name: ebs-sc
   annotations:
     storageclass.kubernetes.io/is-default-class: "true"
+    # ClientSideApply, overriding the Application's ServerSideApply=true.
+    #
+    # StorageClass is one of the handful of built-in types with no structural
+    # schema, so server-side apply cannot build a typed patch for it and the sync
+    # fails with:
+    #
+    #   failed to create typed patch object (/ebs-sc; storage.k8s.io/v1,
+    #   Kind=StorageClass): .spec: field not declared in schema
+    #
+    # This is not a stylistic exception. Server-side apply is on everywhere else
+    # because it is what makes `kubectl apply` idempotent and what stops two
+    # Applications fighting over one object; StorageClass is a single hand-written
+    # object that nothing else in the cluster writes, so it does not need that
+    # guarantee and cannot have it.
+    argocd.argoproj.io/sync-options: ClientSideApply=true
 spec:
   provisioner: ebs.csi.aws.com
   type: gp3
