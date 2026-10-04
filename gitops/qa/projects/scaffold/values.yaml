@@ -21,22 +21,41 @@ quota:
     limits.memory: "1Gi"
     limits.cpu: "1"
 
+# A LIST, and the reason is not cosmetic.
+  #
+  # LimitRange.spec.limits is `[]LimitRangeItem`, where each item has a `type`
+  # (Container / Pod / PersistentVolumeClaim) and then the per-type fields. This used
+  # to be a bare map of default/defaultRequest/max/min, which rendered as
+  #
+  #   spec:
+  #     limits:
+  #       default: {...}
+  #       defaultRequest: {...}
+  #
+  # and the API server rejected it:
+  #
+  #   .spec.limits: expected list, got &{}
+  #
+  # There is no default `type`, so it cannot be inferred - the wrapper and the type
+  # have to both be written out. The template already does `toYaml .Values.limits`,
+  # so only this file needed changing.
 limits:
-  default:
-    cpu: 250m
-    memory: 256Mi
-  defaultRequest:
-    cpu: 50m
-    memory: 64Mi
-  # A burst is allowed but bounded. Without this a pod can ask for far more than
-  # its default and the quota becomes the only thing standing between one project
-  # and an OOMKill of everything else on the node.
-  max:
-    cpu: "1"
-    memory: "512Mi"
-  min:
-    cpu: 10m
-    memory: 32Mi
+  - type: Container
+    default:
+      cpu: 250m
+      memory: 256Mi
+    defaultRequest:
+      cpu: 50m
+      memory: 64Mi
+    # A burst is allowed but bounded. Without this a pod can ask for far more than
+    # its default and the quota becomes the only thing standing between one project
+    # and an OOMKill of everything else on the node.
+    max:
+      cpu: "1"
+      memory: 512Mi
+    min:
+      cpu: 10m
+      memory: 32Mi
 
 networkPolicy:
   enabled: true

@@ -65,6 +65,16 @@ spec:
         #           own. The chart's default already serves /ping here, which is what
         #           lets one NodePort serve both traffic and health checks - a second
         #           NodePort would have to be a number the ALB is not using.
+        #
+        # The ping port is 8082, NOT 8080. Both entrypoints compile down to
+        # containerPort 8080 in the Deployment, and Kubernetes rejects duplicate
+        # containerPorts under server-side apply:
+        #
+        #   .spec.template.spec.containers[name="traefik"].ports: duplicate entries
+        #   for key [containerPort=8080,protocol="TCP"]
+        #
+        # The chart's own default for this entrypoint is 8080, so leaving it alone
+        # collides with `web`. 8082 is the conventional Traefik ping port.
         ports:
           web:
             port: 8080
@@ -72,7 +82,7 @@ spec:
               default: true
             nodePort: 30080
           traefik:
-            port: 8080
+            port: 8082
             expose:
               default: false
             nodePort: null

@@ -30,13 +30,24 @@ rules:
   # Everything inside the namespace, and nothing outside it. There is no wildcard
   # rule and no cluster-scoped rule: a project that needs a cluster resource is a
   # platform change, not a per-project grant.
+  #
+  # One rule, deliberately. An earlier version of this chart carried a second rule
+  # holding `nonResourceURLs: []` and `verbs: []`, on the reasoning that a rule with
+  # nothing in it should be a no-op. It is not a no-op, it is invalid, and RBAC
+  # validation rejects the whole Role:
+  #
+  #   Role.rbac.authorization.k8s.io "project-admin" is invalid:
+  #   [rules[1].verbs: Required value: verbs must contain at least one value,
+  #    rules[1].apiGroups: Required value: resource rules must supply at least one
+  #    api group, rules[1].resources: Required value: resource rules must supply at
+  #    least one resource]
+  #
+  # Note the wording: "resource rules". A rule naming only nonResourceURLs is
+  # allowed, but one naming neither is not - and the empty list is not "neither" to
+  # the validator, it is "a resource rule with nothing in it".
   - apiGroups: ["*"]
     resources: ["*"]
     verbs: ["*"]
-  # Non-resource URLs are namespaced too, but binding them via a Role silently
-  # does nothing, so they are listed explicitly to make the limit visible.
-  - nonResourceURLs: []
-    verbs: []
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
