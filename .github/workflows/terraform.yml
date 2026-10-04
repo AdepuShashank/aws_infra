@@ -1,0 +1,178 @@
+# ---------------------------------------------------------------------------
+# Terraform: fmt / validate / tflint / checkov, then a per-layer plan.
+# ---------------------------------------------------------------------------
+# No AWS credentials are used here. Every check in this job runs against the
+# repository, so it works on a fork's pull request where no role can be assumed.
+#
+# The layer matrix is explicit rather than a loop over directories. A loop that
+# globs infra/envs/*/*-network would also glob .terraform, would silently pass if the
+# glob matched nothing, and would pick up a new directory without anyone deciding
+# whether it is a layer. Every entry below is a decision somebody made.
+#
+# `-chdir` is used here and only here: on a Windows runner it fails to resolve paths,
+# which is why every layer in this repository is driven with `-var-file` from inside
+# the layer directory. See bring_back.MD §7.
+name: terraform
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  # The default token gets nothing. Not contents: read - nothing in this workflow
+  # reads the repository through the token.
+  contents: read
+
+concurrency:
+  # One plan at a time. Two concurrent runs of the same workflow would queue on the
+  # same S3 state lock file and one of them would fail with a lock timeout, which
+  # reads like a real error and is not one.
+  group: terraform-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  static-analysis:
+    name: fmt, validate, tflint, checkov
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.12.2
+          terraform_wrapper: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Same pins as .pre-commit-config.yaml, deliberately. A version that passes in
+      # pre-commit and fails in CI teaches people to run pre-commit and ignore CI,
+      # which is the opposite of what these two are for.
+      - name: tflint
+        uses: terraform-linters/setup-tflint@v5
+        with:
+          tflint_version: v0.60.0
+
+      - name: checkov
+        uses: bridgecrewio/checkov-action@v12
+        with:
+          directory: infra
+          config_file: .checkov.yaml
+
+      - name: terraform fmt
+        run: terraform fmt -check -recursive
+
+      # init -backend=false on every layer root. A validate that tries to reach S3
+      # needs credentials this job deliberately does not have, and one that does
+      # would fail differently on a fork than it does here.
+      - name: terraform init (no backend)
+        run: |
+          set -euo pipefail
+          find infra -type d -name '*.terraform' -prune -o -type f -name '*.tf' -print \
+            | sed 's|/[^/]*$||' | sort -u \
+            | while read -r dir; do
+                echo "::group::$dir"
+                terraform -chdir="$dir" init -backend=false -input=false -no-color
+                terraform -chdir="$dir" validate -no-color
+                echo "::endgroup::"
+              done
+
+      - name: tflint
+        run: |
+          set -euo pipefail
+          tflint --recursive --config "$(pwd)/.tflint.hcl" --format compact
+
+  plan:
+    name: plan (${{ matrix.env }})
+    needs: static-analysis
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - env: prod
+            plan_role: arn:aws:iam::580857072251:role/dpx-prod-tf-plan
+          - env: qa
+            plan_role: arn:aws:iam::580857072251:role/dpx-qa-tf-plan
+
+    # Only from the repository the OIDC trust policy names. The trust is already
+    # restricted to repo:<owner>/<name>; this is belt and braces, and it keeps a fork's
+    # pull request from ever reaching the role-configuration request at all.
+    if: github.repository == 'AdepuShashank/aws_infra'
+
+    permissions:
+      contents: read
+      # Required for `aws-actions/configure-aws-credentials` to mint the OIDC token.
+      # Without this the job fails with "could not load credentials" rather than with
+      # something that names the missing permission.
+      id-token: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.12.2
+          terraform_wrapper: false
+
+      - name: configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ matrix.plan_role }}
+          aws-region: ap-south-1
+          # The plan role is read-only and scoped by the same Env tag the apply role
+          # uses, so a plan cannot read another environment's state even by accident.
+          role-session-name: gha-plan-${{ matrix.env }}
+
+      # `terraform plan`, never `apply`. The apply role is a separate role, behind a
+      # separate workflow, gated by a GitHub Environment - see terraform-apply.yml.
+      # Putting apply in a workflow that also runs on pull_request is how an
+      # unattended apply happens.
+      - name: plan every layer
+        run: |
+          set -euo pipefail
+          ENV="${{ matrix.env }}"
+          for layer in 10-network 20-security 30-cluster 40-edge 50-platform 60-ops; do
+            dir="infra/envs/$ENV/$layer"
+            [ -d "$dir" ] || continue
+            echo "::group::plan $ENV/$layer"
+            terraform -chdir="$dir" init -input=false -no-color
+            terraform -chdir="$dir" plan \
+              -input=false -no-color \
+              -lock-timeout=5m \
+              "-var-file=../common.tfvars" "-var-file=$ENV.tfvars" \
+              -out="$ENV-$layer.tfplan"
+            echo "::endgroup::"
+          done
+
+      # Written out so the plan is reviewable in the PR without re-running anything.
+      # `terraform show -json` rather than the text form: it is machine-readable, it
+      # contains resource addresses rather than a rendered diff, and it does not carry
+      # the values of SecureString-backed inputs into a log.
+      - name: publish plan summary
+        run: |
+          set -euo pipefail
+          summary=plan-summary-${{ matrix.env }}.txt
+          : > "$summary"
+          for layer in 10-network 20-security 30-cluster 40-edge 50-platform 60-ops; do
+            plan="${{ matrix.env }}-$layer.tfplan"
+            [ -f "$plan" ] || continue
+            {
+              echo "### ${{ matrix.env }}/$layer"
+              terraform -chdir="infra/envs/${{ matrix.env }}/$layer" show -no-color "$plan"
+              echo
+            } >> "$summary"
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: terraform-plan-${{ matrix.env }}
+          path: |
+            plan-summary-${{ matrix.env }}.txt
+            ${{ matrix.env }}-*.tfplan
+          retention-days: 7

@@ -1,8 +1,9 @@
 # Build status
 
-Where the build actually is, as of **2026-10-03**. Phases 0-6 are applied in
-prod; 7 and 8 are written but not synced. Two things block the rest, both listed
-at the bottom.
+Where the build actually is, as of **2026-10-04**. Phases 0-6 are applied in prod;
+7 and 8 are written but not synced, because Argo CD still cannot fetch the
+repository. The 60-ops layer, `scripts/`, and CI/CD are now built and plan clean.
+Two things block the rest, both listed at the bottom.
 
 ## PAUSED FOR COST - resume here first
 
@@ -82,9 +83,62 @@ worth losing the cluster's state and the target group registration to get.
 | 6 Platform bootstrap | done (prod) | Calico `v3.32.2` + Argo CD installed by SSM association; every platform pod `Running` |
 | 7 Platform apps | written, not synced | `gitops/prod/apps/*.yaml` exist; Argo CD cannot fetch the repository |
 | 8 Project scaffolding | written, not synced | `gitops/prod/projects/scaffold` Helm chart + ApplicationSet |
-| Backups / observability / scheduler | not built | `60-ops` layer is still the Phase 0 skeleton |
-| Scripts | not built | `scripts/` is empty |
-| CI/CD | not built | `.github/` is empty |
+| Shared Postgres | **written, not synced** | `gitops/prod/apps/shared-postgres/`: `data` namespace, CNPG `Cluster`, backup `CronJob`, three NetworkPolicies. Chart bumped to 0.29.1 (operator 1.30.1) — the pinned 0.28.0 is out of support |
+| 60-ops (`data-backups`, `observability`, `scheduler`) | **built, not applied** | `terraform plan` is clean for prod (25 to add) and qa (17 to add). Needs one re-apply of 10-network per env first — see below |
+| Scripts | **built** | `up.sh`, `down.sh`, `kubeconfig-via-ssm.sh`, `etcd-restore.sh`; all four pass `bash -n` |
+| etcd restore runbook | **written** | [`docs/etcd-restore.md`](etcd-restore.md) |
+| CI/CD | **written, inert** | `.github/workflows/terraform.yml` (plan, no credentials needed) and `terraform-apply.yml`. Neither can assume a role yet — see the OIDC note below |
+
+## One thing to do before applying 60-ops
+
+`10-network` gained a `nat_instance_id` output, because 60-ops needs to know which
+instance to stop on a schedule and `data.aws_instances` only ever returns *running*
+instances — so a tag-based lookup finds nothing while the environment is paused,
+which is exactly when this project spends most of its life.
+
+The output does not exist in either environment's 10-network state until that layer
+is applied again. Until then 60-ops plans with one warning:
+
+```
+Warning: Check block assertion failed
+  on main.tf line 138, in check "targets_present":
+  138:     condition     = local.nat_instance_id != null
+      local.nat_instance_id is null
+```
+
+It is a warning, not an error, and nothing else is wrong. Re-apply 10-network in
+both environments and it goes away.
+
+## What 60-ops creates
+
+| | prod | qa |
+|---|---|---|
+| PostgreSQL backup bucket | yes (SSE-KMS, versioned, lifecycle, ACLs off) | yes |
+| DLM policy for EBS snapshots | yes, 14-day retention, boot volumes excluded | yes |
+| Ops SNS topic + email subscription | yes | yes |
+| CloudWatch log groups + agent install (SSM) | yes | no — no control plane yet |
+| 6 CloudWatch alarms | yes | no — no cluster, no edge |
+| etcd backup-freshness probe + alarm | yes | no |
+| Scheduled stop/start | no — prod is out of scope by default | yes — 19:00 Fri/Sun, 08:00 Mon-Fri IST |
+
+The reason so much of qa is absent is that qa has no 30-cluster and no 40-edge, and
+each absent dependency produces a resource that is not created rather than one that
+is created pointing at nothing. `alarm_count` and `cluster_dependencies` in the
+layer's outputs say which is which.
+
+## The OIDC roles still do not exist
+
+`infra/bootstrap` has `create_github_oidc = false` and
+`github_repository_owner = "REPLACE_ME"` in both `prod.tfvars` and `qa.tfvars`, so
+`dpx-prod-tf-plan`, `dpx-qa-tf-plan`, `dpx-tf-apply-prod` and `dpx-tf-apply-qa` are
+not in the account. The workflows are written against those names and will fail at
+`configure-aws-credentials` until they are created. The `plan` job's static-analysis
+sibling needs no credentials and works today.
+
+The role names are not symmetric on purpose — `dpx-<env>-tf-plan` versus
+`dpx-tf-apply-<env>` — because a consistent scheme makes it one character easier to
+put the wrong one in a workflow, and that character is the difference between a plan
+and a write.
 
 ## Current prod cluster
 
@@ -176,6 +230,31 @@ and are commented at the fix site.
 Plus the sizing correction: `t4g.medium` is **2** vCPU, not 1 as the sizing notes
 assumed.
 
+## Bugs found while writing 60-ops, GitOps and the scripts
+
+Found by `terraform validate` and `terraform plan` against this account, not by
+reading. Each would have been an apply-time or run-time failure.
+
+| Where | Symptom | Cause |
+|---|---|---|
+| `modules/data-backups/dlm.tf` | `invalid value for description` at plan time | The DLM API rejects a description containing `.` or `:`. Verified character by character against ap-south-1; the CLI reference the error links to does not document it |
+| `modules/data-backups/dlm.tf` | `Unsupported block type: default_policy`, `target_tags`, `exclude_boot_volumes` | Provider v6 uses the newer DLM policy language. `policy_type`, `resource_types = ["VOLUME"]`, a `schedule` with `create_rule`/`retain_rule`, and `parameters.exclude_boot_volume` |
+| `envs/*/60-ops` | `Unable to find remote state` against 30-cluster and 40-edge | `terraform_remote_state` hard-fails on a key that has never been written, and qa has neither layer. Those two ids are now explicit variables with `check` blocks naming them |
+| `envs/*/60-ops` | `data.aws_instances` returned `[]` for a stopped control plane | The data source returns running instances only. Verified with a standalone config. Every tag-based discovery path for the cluster fails while the environment is paused |
+| `modules/observability/main.tf` | `slice(split("/", alb_arn), 7, 9)` out of range | The ARN has **four** slash-separated fields, not nine — the `arn:aws:...:loadbalancer` prefix contains none. Derived with two regex `replace` calls instead |
+| `modules/scheduler` | `"kms_key_arn" (alias/aws/scheduler) is an invalid ARN` | `kms_key_arn` takes a full ARN. Left unset by default, which is what makes Scheduler use the AWS-managed key |
+| `platform-bootstrap/templates/bootstrap-platform.sh.tftpl` | **The root Application would have wrecked the cluster** | The root app is `directory: recurse: true` over `gitops/<env>`, which walks `projects/scaffold/` — a Helm chart. Argo CD renders it with `.Release.Namespace = argocd`, so it would try to apply a Namespace named `argocd` labelled `pod-security.kubernetes.io/enforce: restricted`, plus a default-deny NetworkPolicy cutting Argo CD off from the API server it reconciles against. Fixed with an `exclude` glob |
+| `gitops/*/apps/cloudnative-pg.yaml` | Wrong claim, and an out-of-support chart | The header said the ApplicationSet creates the `Cluster`. It does not — the ApplicationSet only makes namespaces. Chart 0.28.0 (operator 1.29.x) is out of support; now 0.29.1 / 1.30.1 |
+
+Two things that looked like bugs and were not, recorded so nobody re-chases them:
+
+- `aws elbv2 describe-load-balancers --query 'LoadBalancers[].Tags'` returns empty
+  for this ALB. `aws elbv2 describe-tags` shows all ten tags present. The load
+  balancer is fine; the first query is not evidence of anything.
+- `terraform -chdir` fails to resolve paths on this Windows machine. That is why
+  every layer is driven from inside its own directory with `Push-Location`, and why
+  the GitHub workflows use `-chdir` on `ubuntu-latest` where it works.
+
 ## Read these before changing anything
 
 | Document | Why |
@@ -186,3 +265,5 @@ assumed.
 | [`docs/versions.md`](versions.md) | Every pinned version, and how each was verified |
 | [`docs/state-layout.md`](state-layout.md) | Layer ordering and state keys |
 | [`docs/security-baseline.md`](security-baseline.md) | SG and IAM baseline |
+| [`docs/etcd-restore.md`](etcd-restore.md) | Phase 4's untested acceptance item, now written |
+| [`infra/modules/README.md`](../infra/modules/README.md) | Which module owns what, and why the etcd bucket is in `cluster` |

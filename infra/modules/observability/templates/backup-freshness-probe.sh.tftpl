@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+# Publishes the age of the newest etcd snapshot as a CloudWatch metric.
+#
+# Rendered from templates/backup-freshness-probe.sh.tftpl. A shell parameter
+# expansion in braces would be claimed by templatefile before bash saw it, so this
+# file uses $NAME throughout.
+#
+# One datapoint per run, no state kept between runs: the metric is a function of
+# what is in the bucket right now, so a probe that has been off for a week reports
+# the truth about that week rather than what it last remembered.
+set -uo pipefail
+
+REGION=__REGION__
+ENVIRONMENT=__ENV__
+BUCKET=__ETCD_BUCKET__
+NAMESPACE=__METRIC_NAMESPACE__
+METRIC=EtcdSnapshotAgeMinutes
+
+# Sorting on LastModified rather than taking the first page of keys: the key is
+# etcd-<UTC timestamp>.db, so lexical order and age agree, but sorting asks S3 for
+# an answer about modification time instead of trusting that two formats agree.
+LATEST="$(aws s3api list-objects-v2 \
+  --region "$REGION" \
+  --bucket "$BUCKET" \
+  --prefix etcd- \
+  --query 'sort_by(Contents || `@`, &LastModified)[-1].LastModified' \
+  --output text 2>/dev/null)"
+
+# No object, or a listing that failed, both land here. Nothing is published in that
+# case: a fabricated large age would turn a permission problem into a plausible
+# "backups are stale" page, and a real staleness story is worth exactly nothing if
+# it can also mean "this script lost its IAM grant".
+#
+# The alarm's treat_missing_data = breaching turns the absence into the alarm, which
+# is the outcome that is true either way.
+if [ -z "$LATEST" ] || [ "$LATEST" = "None" ] || [ "$LATEST" = "null" ]; then
+  echo "ERROR: no etcd snapshot found in s3://$BUCKET" >&2
+  exit 1
+fi
+
+SNAPSHOT_EPOCH="$(date -u -d "$LATEST" +%s 2>/dev/null)"
+if [ -z "$SNAPSHOT_EPOCH" ]; then
+  echo "ERROR: could not parse LastModified '$LATEST'" >&2
+  exit 1
+fi
+
+NOW_EPOCH="$(date -u +%s)"
+AGE_MINUTES=$(( (NOW_EPOCH - SNAPSHOT_EPOCH) / 60 ))
+
+aws cloudwatch put-metric-data \
+  --region "$REGION" \
+  --namespace "$NAMESPACE" \
+  --metric-name "$METRIC" \
+  --value "$AGE_MINUTES" \
+  --unit Count \
+  --dimensions "Env=$ENVIRONMENT,Component=etcd" \
+  --timestamp "$(date -u +%Y-%m-%dT%H:%M:%SZ)" || {
+  echo "ERROR: put-metric-data failed" >&2
+  exit 1
+}
+
+echo "$METRIC=$AGE_MINUTES minutes (newest snapshot $LATEST)"

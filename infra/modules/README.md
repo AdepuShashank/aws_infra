@@ -14,19 +14,14 @@ and exposes documented outputs. No module may hardcode an account id, region or 
 
 | Module | Purpose | Built in |
 |---|---|---|
-| `network` | VPC, 2 public + 2 private subnets, route tables, S3 gateway endpoint, fck-nat, optional flow logs | Phase 2 |
-
-Implementation note: fck-nat is a single `aws_instance`, not the upstream
-`nat-instance` submodule. AWS provider 6 removed `instance_id` as a writable
-target on `aws_route`, and an ASG cannot expose its instances' ENI ids without
-racing instance boot. See [`docs/adr/0001-fck-nat.md`](../../docs/adr/0001-fck-nat.md).
-
-| `cluster` | Control-plane EC2 (fixed-ENI / fixed private IP), worker ASG, launch templates, cloud-init | Phase 4 (built) |
+| `network` | VPC, 2 public + 2 private subnets, route tables, S3 gateway endpoint, fck-nat, optional flow logs | Phase 2 (built) |
+| `security` | Security groups, node IAM role + instance profile, KMS keys, SSM path definitions | Phase 3 (built) |
+| `cluster` | Control-plane EC2 (fixed-ENI / fixed private IP), worker ASG, launch templates, cloud-init, **etcd backup bucket** | Phase 4 (built) |
 | `edge` | ALB, listeners, target group, optional Route 53 / ACM | Phase 5 (built) |
 | `platform-bootstrap` | SSM-driven install of Calico + Argo CD + root app-of-apps | Phase 6 (built) |
-| `data-backups` | S3 buckets (etcd, postgres), lifecycle rules, DLM snapshot policy | Phase 7 |
-| `observability` | CloudWatch log groups, alarms, SNS topic | Phase 7 |
-| `scheduler` | EventBridge Scheduler stop/start schedules (qa) | Phase 7 |
+| `data-backups` | PostgreSQL backup bucket + lifecycle, **DLM policy for EBS snapshots** | 60-ops (built) |
+| `observability` | Ops SNS topic, CloudWatch log groups and the agent that fills them, 6 alarms, etcd backup-freshness probe | 60-ops (built) |
+| `scheduler` | EventBridge Scheduler stop/start schedules (qa) | 60-ops (built) |
 
 Implementation notes:
 
@@ -38,12 +33,19 @@ Implementation notes:
   `_egress_rule` resources rather than inline blocks, because the ALB and worker
   groups reference each other and inline blocks would be a dependency cycle. See
   [`docs/security-baseline.md`](../../docs/security-baseline.md).
-
-Module directories exist from Phase 0 so the repository skeleton is stable, but
-they stay empty until their phase is implemented.
-
-Module directories exist from Phase 0 so the repository skeleton is stable, but they stay empty
-until their phase is implemented — see [`CHECKPOINT.md`](../../CHECKPOINT.md).
+- **The etcd backup bucket is in `cluster`, not `data-backups`.** Phase 4 is the
+  first layer that needs it, and the control plane's snapshot timer uploads fifteen
+  minutes after first boot — a bucket created one layer later would be missing at
+  exactly the moment it is first used, and the timer's systemd unit does not check
+  the upload's exit code. `data-backups` creates the postgres bucket and derives both
+  names rather than creating a second etcd bucket.
+- **`data-backups` does not configure CloudNativePG's S3 backup.** That path wants a
+  Kubernetes Secret holding an `access-key-id` and a `secret-access-key` — long-lived
+  AWS keys, which this project deliberately has none of. Postgres is backed up by a
+  scheduled `pg_dump` in `gitops/<env>/apps/shared-postgres/`, using the node role
+  through the S3 gateway endpoint.
+- **Module directories existed from Phase 0 so the repository skeleton was stable.**
+  Every one now has an implementation.
 
 ## Conventions
 

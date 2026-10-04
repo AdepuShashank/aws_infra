@@ -1,0 +1,30 @@
+# ---------------------------------------------------------------------------
+# The `data` namespace.
+# ---------------------------------------------------------------------------
+# Own rather than created by Argo CD's CreateNamespace, for the reason the project
+# scaffold gives: CreateNamespace produces a bare Namespace, Pod Security Admission
+# reads its labels at admission time, so a namespace created that way has already
+# been evaluated as Privileged before anyone can set enforce on it.
+#
+# baseline, not restricted. A restricted namespace forbids hostPath, privileged
+# containers and the default service account token; PostgreSQL needs none of those,
+# but CloudNativePG's instance pods set capabilities and run with a non-root uid the
+# restricted profile rejects in some configurations. baseline still blocks the
+# genuinely dangerous things (privileged, host namespaces, hostPath), which is the
+# part that matters on a namespace whose pods hold every project's data.
+#
+# Every project namespace enforces restricted. This one is the exception, and the
+# exception is a platform component rather than a tenant.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: data
+  labels:
+    pod-security.kubernetes.io/enforce: baseline
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted
+    app.kubernetes.io/part-of: dpx
+    dpx.io/env: prod
+  annotations:
+    dpx.io/component: "shared-database"

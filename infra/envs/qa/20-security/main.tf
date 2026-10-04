@@ -104,16 +104,16 @@ module "security" {
 }
 
 # The bucket names are owned here because they must match the object ARNs the
-# node role is granted in 20-security. 70-backups derives the same names with
+# node role is granted in 20-security. 60-ops derives the same names with
 # this suffix stripped, so the two layers cannot drift apart.
 check "backup_bucket_names" {
   assert {
     condition     = var.etcd_backup_bucket_name == format("%s-%s-etcd-backups", var.project, var.env)
-    error_message = "etcd_backup_bucket_name must be <project>-<env>-etcd-backups so 70-backups can derive it."
+    error_message = "etcd_backup_bucket_name must be <project>-<env>-etcd-backups so 60-ops can derive it."
   }
 
   assert {
     condition     = var.postgres_backup_bucket_name == format("%s-%s-postgres-backups", var.project, var.env)
-    error_message = "postgres_backup_bucket_name must be <project>-<env>-postgres-backups so 70-backups can derive it."
+    error_message = "postgres_backup_bucket_name must be <project>-<env>-postgres-backups so 60-ops can derive it."
   }
 }

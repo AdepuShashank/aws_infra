@@ -1,9 +1,9 @@
 # ---------------------------------------------------------------------------
 # etcd backup bucket
 # ---------------------------------------------------------------------------
-# Created here, not in 70-backups, because Phase 4 is the first layer that needs
+# Created here, not in 60-ops, because Phase 4 is the first layer that needs
 # it: the control plane's snapshot timer uploads to this bucket on first boot, and
-# the upload fails if the bucket does not exist. 70-backups will reference this
+# the upload fails if the bucket does not exist. 60-ops will reference this
 # bucket's name rather than create a second one, so there is exactly one bucket
 # per environment.
 #

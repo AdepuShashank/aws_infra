@@ -1,0 +1,172 @@
+# ---------------------------------------------------------------------------
+# Terraform apply, per environment, behind a GitHub Environment.
+# ---------------------------------------------------------------------------
+# Separate from terraform.yml on purpose. That workflow runs on every pull request and
+# its plan job holds a read-only role; an apply in the same file is one `if:` away
+# from running on a fork.
+#
+# The gating is deliberately layered, and each layer fails a different mistake:
+#
+#   1. workflow_dispatch        nothing happens without a human asking, by name, for
+#                               a specific environment.
+#   2. GitHub Environment       required reviewers, branch restriction, and wait
+#                               timer - configured in the repository, not here.
+#                               `environment:` is what makes those apply.
+#   3. The apply role's own trust  restricted to
+#      policy                    repo:<owner>/<name>:environment:<env> - so even a
+#                               correctly-minted token from a different workflow
+#                               cannot assume it.
+#   4. AWS                       the role is additionally scoped by request and
+#                               resource tag Env=<env>.
+#
+# Removing any one of these leaves the next to do its job. The workflow_dispatch
+# input is an assertion, not a control: it exists so the run's purpose is legible in
+# the Actions UI, and it is checked rather than trusted.
+name: terraform-apply
+
+on:
+  workflow_dispatch:
+    inputs:
+      env:
+        description: Environment to apply
+        required: true
+        type: choice
+        options:
+          - prod
+          - qa
+      auto_approve:
+        description: Apply without a confirmation prompt (the GitHub Environment reviewer is still required)
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+# No cancel-in-progress. An apply that has taken the state lock and is halfway
+# through creating resources is not something to cancel; a second apply starting while
+# the first holds the lock fails with a timeout and leaves the state ambiguous.
+concurrency:
+  group: terraform-apply-${{ inputs.env }}
+  cancel-in-progress: false
+
+jobs:
+  apply:
+    name: apply ${{ inputs.env }}
+    runs-on: ubuntu-latest
+
+    # The Environment named here must exist in the repository with its required
+    # reviewers configured. A job referencing an Environment that does not exist fails
+    # at the "awaiting approval" step rather than at the apply, which is the right
+    # order for a mistake this expensive.
+    environment:
+      name: ${{ inputs.env }}
+
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.12.2
+          terraform_wrapper: false
+
+      # Two guards on the same thing, and the second is the one that matters.
+      #
+      # The first: the choice input above already constrains the value, and the
+      # workflow_dispatch API rejects anything else. But that constrains the API, not
+      # what reaches this step, and a workflow file edited in a branch is a normal
+      # thing to review and merge. The apply role's trust policy is the actual
+      # boundary; this check exists so a mistake here is a clear error rather than a
+      # confusing AssumeRoleWithWebIdentity failure 40 lines later.
+      - name: validate inputs
+        run: |
+          set -euo pipefail
+          case "${{ inputs.env }}" in
+            prod | qa) ;;
+            *) echo "::error::env must be prod or qa"; exit 1 ;;
+          esac
+
+      - name: configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          # The two roles have different names on purpose:
+          #   plan  dpx-<env>-tf-plan
+          #   apply dpx-tf-apply-<env>
+          # A consistent scheme would have made it one character easier to put the
+          # wrong one here, and that character is the difference between a plan and a
+          # write.
+          role-to-assume: arn:aws:iam::580857072251:role/dpx-tf-apply-${{ inputs.env }}
+          aws-region: ap-south-1
+          role-session-name: gha-apply-${{ inputs.env }}
+
+      - name: verify the credentials are the apply role
+        run: |
+          set -euo pipefail
+          ARN="$(aws sts get-caller-identity --query Arn --output text)"
+          echo "::notice::assumed $ARN"
+          case "$ARN" in
+            arn:aws:sts::*:assumed-role/dpx-tf-apply-${{ inputs.env }}/*) ;;
+            *) echo "::error::wrong role: $ARN"; exit 1 ;;
+          esac
+
+      - name: apply
+        if: ${{ !inputs.auto_approve }}
+        run: |
+          set -euo pipefail
+          ENV="${{ inputs.env }}"
+          for layer in 10-network 20-security 30-cluster 40-edge 50-platform 60-ops; do
+            dir="infra/envs/$ENV/$layer"
+            [ -d "$dir" ] || continue
+            echo "::group::apply $ENV/$layer"
+            terraform -chdir="$dir" init -input=false -no-color
+            # No -auto-approve. The plan is printed and the step ends; re-running with
+            # auto_approve set is a second, deliberate action.
+            terraform -chdir="$dir" apply \
+              -input=false -no-color \
+              -lock-timeout=5m \
+              "-var-file=../common.tfvars" "-var-file=$ENV.tfvars"
+            echo "::endgroup::"
+          done
+
+      - name: apply (auto-approve)
+        if: ${{ inputs.auto_approve }}
+        run: |
+          set -euo pipefail
+          ENV="${{ inputs.env }}"
+          for layer in 10-network 20-security 30-cluster 40-edge 50-platform 60-ops; do
+            dir="infra/envs/$ENV/$layer"
+            [ -d "$dir" ] || continue
+            echo "::group::apply $ENV/$layer"
+            terraform -chdir="$dir" init -input=false -no-color
+            terraform -chdir="$dir" apply \
+              -input=false -no-color -auto-approve \
+              -lock-timeout=5m \
+              "-var-file=../common.tfvars" "-var-file=$ENV.tfvars"
+            echo "::endgroup::"
+          done
+
+      # Every layer's plan output, after the fact. This is the record of what actually
+      # changed, kept where it can be read rather than only in a scrollback buffer.
+      - name: publish apply summary
+        if: always()
+        run: |
+          set -euo pipefail
+          ENV="${{ inputs.env }}"
+          {
+            echo "# apply $ENV at $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            for layer in 10-network 20-security 30-cluster 40-edge 50-platform 60-ops; do
+              state="infra/envs/$ENV/$layer/terraform.tfstate"
+              [ -f "$state" ] && terraform -chdir="infra/envs/$ENV/$layer" state list | sed "s/^/$layer: /"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: terraform-apply-${{ inputs.env }}
+          path: "$GITHUB_STEP_SUMMARY"
+          retention-days: 30

@@ -72,12 +72,12 @@ variable "ssm_path_prefix" {
 }
 
 variable "etcd_backup_bucket_name" {
-  description = "Etcd snapshot bucket the node role may write. 70-backups creates a bucket with this exact name."
+  description = "Etcd snapshot bucket the node role may write. 60-ops creates a bucket with this exact name."
   type        = string
 }
 
 variable "postgres_backup_bucket_name" {
-  description = "PostgreSQL backup bucket the node role may write. 70-backups creates a bucket with this exact name."
+  description = "PostgreSQL backup bucket the node role may write. 60-ops creates a bucket with this exact name."
   type        = string
 }
 

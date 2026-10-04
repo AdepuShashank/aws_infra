@@ -47,5 +47,5 @@ The node role attaches three AWS-managed policies:
 
 `20-security` grants the node role object access to
 `dpx-<env>-etcd-backups` and `dpx-<env>-postgres-backups`, but does not
-create them; `70-backups` owns those. A `check` block in the root asserts the
+create them; `60-ops` owns those. A `check` block in the root asserts the
 names match the pattern exactly, so the grant and the bucket cannot drift apart.

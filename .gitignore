@@ -10,7 +10,14 @@
 *.pfx
 id_rsa*
 kubeconfig
-kubeconfig-*
+# Anchored to the repository root on purpose. The unanchored form `kubeconfig-*`
+# also matches scripts/kubeconfig-via-ssm.sh, which is a file Infrastructure.MD
+# requires and which this pattern silently kept out of the repository for as long as
+# it existed. A generated kubeconfig is written to ./kubeconfig-<env> from the repo
+# root, so anchoring here loses nothing and stops the rule eating its own tooling.
+# The negation below is belt and braces for the same reason.
+/kubeconfig-*
+!scripts/kubeconfig-via-ssm.sh
 admin.kubeconfig
 secrets.auto.tfvars
 

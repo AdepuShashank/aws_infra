@@ -282,7 +282,7 @@ variable "alb_target_group_arns" {
 # ------------------------------------------------------------- etcd backup ---
 
 variable "etcd_backup_bucket_name" {
-  description = "S3 bucket for etcd snapshots. Created here; 70-backups reuses the name."
+  description = "S3 bucket for etcd snapshots. Created here; 60-ops reuses the name."
   type        = string
 }
 

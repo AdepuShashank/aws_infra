@@ -70,6 +70,11 @@ output "nat_security_group_id" {
   value       = module.network.nat_security_group_id
 }
 
+output "nat_instance_id" {
+  description = "Instance id of the NAT instance. 60-ops reads this from remote state as a scheduled-stop target: it is the one instance in this layer that costs money while doing nothing, and unlike the cluster it can be stopped and started without losing anything."
+  value       = module.network.nat_instance_id
+}
+
 output "nat_spot_warning" {
   description = "Single point of failure warning for the NAT instance."
   value       = module.network.nat_spot_warning

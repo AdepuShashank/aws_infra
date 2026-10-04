@@ -9,7 +9,7 @@
 traefik_nodeports = [30080]
 
 # Bucket names the node role is granted object access to in the IAM policy.
-# The check block in main.tf asserts these match the names 70-backups derives,
+# The check block in main.tf asserts these match the names 60-ops derives,
 # so the two layers cannot drift.
 etcd_backup_bucket_name     = "dpx-qa-etcd-backups"
 postgres_backup_bucket_name = "dpx-qa-postgres-backups"

@@ -411,6 +411,36 @@ else
 fi
 
 log "creating the root Application pointing at $EFFECTIVE_REPO_URL:$GITOPS_REPO_PATH"
+# The exclude glob is load-bearing, and the reason is specific to this layout.
+#
+# The root app is a plain directory source with recurse: true, which walks every
+# YAML under gitops/<env>. That includes projects/scaffold/, which is a HELM CHART:
+# Chart.yaml plus values.yaml plus templates/*.yaml containing {{ .Release.Namespace }}
+# and friends. Argo CD does not ignore Helm charts inside a directory source - it
+# detects the Chart.yaml and renders it, using the root app's destination namespace
+# (argocd) as .Release.Namespace. So without this exclude:
+#
+#   * the scaffold renders a Namespace object named "argocd", labelled
+#     pod-security.kubernetes.io/enforce: restricted, which Pod Security Admission
+#     then evaluates against Argo CD's own pods;
+#   * the ResourceQuota, LimitRange, Role, RoleBinding and five NetworkPolicies land
+#     in the argocd namespace, where the default-deny egress would cut Argo CD off
+#     from the API server it is reconciling against.
+#
+# Excluding projects/** leaves the root app managing only apps/*.yaml, which is what
+# it should manage: the Application definitions. The ApplicationSet in apps/ is the
+# thing that points at projects/scaffold, and it sets its own destination namespace
+# per project.
+#
+# apps/shared-postgres/** is excluded from the other direction. Its manifests are
+# plain Kubernetes objects rather than an Application, so the root app would apply
+# them into the argocd namespace while the Application that owns them applies them
+# into data. Two owners for one object means self-heal fighting prune, and the loser
+# is whichever one you were not looking at. Every directory under apps/ that holds
+# real manifests needs its own entry here.
+#
+# The braces are required: Argo CD parses this as a comma-separated brace group, and
+# a single unbraced pattern containing a slash behaves differently.
 cat <<EOF | kubectl apply -f -
 apiVersion: argoproj.io/v1alpha1
 kind: Application
@@ -427,6 +457,7 @@ spec:
     path: $GITOPS_REPO_PATH
     directory:
       recurse: true
+      exclude: '{projects/**,apps/shared-postgres/**,*.md}'
   destination:
     server: https://kubernetes.default.svc
     namespace: argocd

@@ -91,7 +91,7 @@ output "ami_resolution_method" {
 }
 
 output "etcd_backup_bucket" {
-  description = "Bucket receiving etcd snapshots. 70-backups references this rather than creating a second bucket."
+  description = "Bucket receiving etcd snapshots. 60-ops references this rather than creating a second bucket."
   value       = module.cluster.etcd_backup_bucket
 }
 

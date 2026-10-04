@@ -1,0 +1,171 @@
+# ---------------------------------------------------------------------------
+# The shared PostgreSQL cluster.
+# ---------------------------------------------------------------------------
+# One instance, ten databases. Ten separate instances is the arrangement a real
+# platform would use for isolation; it is not the arrangement this account can run.
+# docs/quota.md has the arithmetic, and the short version is that a second t4g.nano
+# is two more vCPUs against a limit of eight that prod's control plane and two NAT
+# instances already compete for.
+#
+# Sizing is deliberately at the floor. A t4g.medium worker runs Calico, kube-proxy,
+# the CNI, the CSI driver, Traefik, the CNPG operator and this. Postgres at
+# shared_buffers=128MB is well inside what ten throwaway databases need.
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: shared-postgres
+  namespace: data
+  labels:
+    app.kubernetes.io/name: shared-postgres
+    app.kubernetes.io/part-of: dpx
+    dpx.io/env: qa
+  annotations:
+    # Wave 1: after the namespace (wave 0, 00-namespace.yaml), before the backup
+    # Job, which must not start against a database that has not accepted connections.
+    argocd.argoproj.io/sync-wave: "1"
+spec:
+  # One instance, and it stays one. A second instance needs a Streaming Replication
+  # slot, which is a synchronous-commit-capable HA setup, and on a single-worker
+  # cluster the standby would usually land on the same node as the primary and buy
+  # nothing. Two workers and a quorum that depends on both would be worse: a
+  # simultaneous reclaim of two Graviton spot nodes takes the database with it.
+  instances: 1
+
+  # No anti-affinity. With one instance there is nowhere else for it to go, and an
+  # anti-affinity rule with no second eligible node leaves the pod Pending forever -
+  # which is the failure that makes an availability requirement worse than none.
+  storage:
+    # ebs-sc, not a StorageClass named here: gitops/prod/apps/ebs-csi.yaml owns it,
+    # and it is already gp3 with encrypted: "true" and the account's EBS KMS key.
+    # Naming it here would be a second definition of the same thing.
+    size: 1Gi
+
+  # WAL on the same volume as PGDATA. Splitting them needs a second PVC, which
+  # matters when restore time is dominated by WAL replay and is pure overhead at
+  # this size.
+  walStorage:
+    size: 1Gi
+
+  # Pinned, and the tag carries its distro because CloudNativePG requires one: a bare
+  # `17.6` does not resolve to an image the operator accepts. `system-trixie` is the
+  # Debian 13 build the 1.2x/1.30 series publishes for PostgreSQL 17.
+  #
+  # 17 rather than 18 on purpose: 18 is the operator's default from 1.27.2 onwards, so
+  # leaving imageName off would take this cluster's major version forward during an
+  # ordinary Argo CD sync. PostgreSQL major upgrades are one-way and need WAL replay
+  # on top of a dump to be safe; they should be a decision, not a default.
+  imageName: ghcr.io/cloudnative-pg/postgresql:17.6-system-trixie
+
+  # ------------------------------------------------------------------ bootstrap
+  # initdb runs exactly once, on an empty data directory. Everything declared here is
+  # permanent: changing it later does nothing to an existing cluster, and CNPG
+  # refuses to change bootstrap on a live cluster at all. That is why the databases
+  # and users are declarative here rather than created by hand later.
+  bootstrap:
+    initdb:
+      database: app
+      owner: postgres
+
+      # The role the projects connect as. One role for all ten, not one per project:
+      # the isolation that matters between these projects is the database boundary,
+      # and a single role keeps the credential story to one Secret rather than ten.
+      # Per-project roles are a two-line addition to this list if that trade is ever
+      # worth making.
+      users:
+        - name: app
+          database: app
+          # CNPG generates the password into a Secret named after secretName on first
+          # bootstrap and never rotates it on its own. Nothing about it is in this
+          # repository, which is the point - see the note on credential distribution
+          # below.
+          secretName: shared-postgres-app
+          options: "-c search_path=app,public"
+
+  # ------------------------------------------------------------------ access
+  postgresql:
+    # Off. The superuser exists for pg_upgrade and for the operator's own
+    # maintenance connections; a project backend that can reach it bypasses every
+    # per-database boundary above, and there is no reason in this project for a
+    # tenant to have it.
+    enableSuperuserAccess: false
+
+    parameters:
+      # 128MB on a 2GB t4g.medium, shared with everything else on the node.
+      shared_buffers: "128MB"
+      # Effective cache size is what the planner assumes; setting it equal to
+      # shared_buffers makes the planner assume every read is a miss, which produces
+      # index scans where sequential scans were cheaper.
+      effective_cache_size: "512MB"
+      max_connections: "50"
+      # Log anything slower than 200ms. The backup CronJob's pg_dump and Argo CD's
+      # own queries are the only heavy users, so this stays quiet in normal operation
+      # and is not silent during an incident.
+      log_min_duration_statement: "200"
+      logging_collector: "on"
+      log_directory: "/var/log/postgresql"
+
+  # --------------------------------------------------------------- resources
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      # No CPU limit. A limit on a latency-sensitive database turns a burst into
+      # queueing and the queueing into timeouts; the memory limit is the one that has
+      # to exist, because Postgres cannot be OOM-managed and a node-level OOMKill of
+      # the container loses the page cache with it.
+      memory: 512Mi
+
+  # ------------------------------------------------------------------ updates
+  # Rolling, one instance at a time. Major upgrades have to be declared explicitly -
+  # a declarative `postgresql: major` here would silently take the project's only
+  # database through a version upgrade during an ordinary Argo CD sync.
+  primaryUpdateStrategy: unsupervised
+  primaryUpdateMethod: switchover
+
+  # No `backup:` stanza, on purpose.
+  #
+  # CloudNativePG's S3 backup needs a Kubernetes Secret holding an access-key-id and
+  # a secret-access-key. Those are long-lived AWS keys, and there are none in this
+  # account by design - Phase 3's IAM baseline exists so that a compromised pod
+  # cannot reach one. The alternative that needs no credentials is
+  # `method: volumeSnapshot`, which needs the snapshot.storage.k8s.io CRDs; kubeadm
+  # does not install them and the aws-ebs-csi-driver chart ships
+  # volumeSnapshotClasses: [] by default, so that is another component to install
+  # and pin.
+  #
+  # What runs instead is a scheduled pg_dump in this same directory, using the node
+  # role for the S3 write. See 30-backup-job.yaml.
+
+  monitoring:
+    # No PodMonitor: kube-prometheus-stack is Phase 7 optional and disabled by
+    # default, and a PodMonitor with no Prometheus to read it is a manifest that
+    # looks like monitoring and is not.
+    enablePodMonitor: false
+
+# ---------------------------------------------------------------------------
+# Credentials: where they are, and what is deliberately missing
+# ---------------------------------------------------------------------------
+# `pg_dump` needs the app role's password, and CNPG put it in the Secret
+# shared-postgres-app in THIS namespace. The backup Job runs here, so it can read it
+# without any cross-namespace grant.
+#
+# What a project backend in its own namespace does not have is a way to read that
+# Secret, and no such path is built here. Distributing it is deliberately out of
+# scope: Infrastructure.MD puts deploying the projects' real code out of scope, and
+# every mechanism for doing it - a per-namespace Role here, an ExternalSecret
+# mirroring it into ten namespaces, or CNPG's declarative role secrets - is a
+# decision that should be made when there is a real project with a real secret
+# format, not guessed at now.
+#
+# To read the credentials as an operator, from a session on the control plane:
+#
+#   kubectl -n data get secret shared-postgres-app \
+#     -o jsonpath='{.data.username}' | base64 -d; echo
+#   kubectl -n data get secret shared-postgres-app \
+#     -o jsonpath='{.data.password}' | base64 -d; echo
+#
+# and to connect from an SSM session on the control plane:
+#
+#   kubectl -n data port-forward svc/shared-postgres-rw 5432:5432
+#   psql "postgresql://app@localhost:5432/app"

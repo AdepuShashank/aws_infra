@@ -1,0 +1,166 @@
+# ---------------------------------------------------------------------------
+# NetworkPolicies for the data namespace.
+# ---------------------------------------------------------------------------
+# The project scaffold already denies each project namespace everything except DNS,
+# Traefik, its own frontend/backend pair and postgres in this namespace. That is the
+# ingress side of the story and it is enforced from the project's side.
+#
+# This file is the other side. Without it, `data` has no policy at all, and a
+# namespace with no NetworkPolicy is fully reachable from anywhere in the cluster -
+# so any pod that reaches default-deny anywhere, or any new namespace created without
+# the scaffold, can connect to the one database holding every project's data.
+#
+# Two policies, because Calico evaluates ingress and egress independently and
+# "select all pods, both directions" is what actually makes a namespace's ingress
+# closed.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+  namespace: data
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
+spec:
+  # Empty podSelector means every pod in the namespace, including future ones. The
+  # alternative - labelling this policy's selector and naming pods - means a pod
+  # someone forgets to label is unprotected.
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns
+  namespace: data
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
+spec:
+  podSelector: {}
+  policyTypes:
+    - Egress
+
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-postgres-from-projects
+  namespace: data
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
+spec:
+  # The pods that serve the database. Matching on the component label CNPG puts on
+  # instance pods rather than on the Cluster's name, so it survives renaming.
+  podSelector:
+    matchLabels:
+      cnpg.io/cluster: shared-postgres
+  policyTypes:
+    - Ingress
+
+  ingress:
+    # Only the backend pods of the ten project namespaces. Not Traefik: an Ingress
+    # route is handled by Traefik and does not terminate at the database, and
+    # allowing it would mean anything with an IngressRoute could reach postgres.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              app.kubernetes.io/part-of: dpx
+              dpx.io/project: project-01
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/component: backend
+        - namespaceSelector:
+            matchLabels:
+              app.kubernetes.io/part-of: dpx
+              dpx.io/project: project-02
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/component: backend
+        - namespaceSelector:
+            matchLabels:
+              app.kubernetes.io/part-of: dpx
+              dpx.io/project: project-03
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/component: backend
+        - namespaceSelector:
+            matchLabels:
+              app.kubernetes.io/part-of: dpx
+              dpx.io/project: project-04
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/component: backend
+        - namespaceSelector:
+            matchLabels:
+              app.kubernetes.io/part-of: dpx
+              dpx.io/project: project-05
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/component: backend
+        - namespaceSelector:
+            matchLabels:
+              app.kubernetes.io/part-of: dpx
+              dpx.io/project: project-06
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/component: backend
+        - namespaceSelector:
+            matchLabels:
+              app.kubernetes.io/part-of: dpx
+              dpx.io/project: project-07
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/component: backend
+        - namespaceSelector:
+            matchLabels:
+              app.kubernetes.io/part-of: dpx
+              dpx.io/project: project-08
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/component: backend
+        - namespaceSelector:
+            matchLabels:
+              app.kubernetes.io/part-of: dpx
+              dpx.io/project: project-09
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/component: backend
+        - namespaceSelector:
+            matchLabels:
+              app.kubernetes.io/part-of: dpx
+              dpx.io/project: project-10
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/component: backend
+      ports:
+        - protocol: TCP
+          port: 5432
+
+    # The backup Job below, in this namespace. A podSelector with no matchLabels
+    # means every pod here, which today is only that Job - and keeps working if the
+    # database ever moves namespaces, at the cost of also matching anything else that
+    # lands here. Named explicitly instead, and a policy that names one workload
+    # cannot quietly become a policy that names all of them.
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: shared-postgres-backup
+      ports:
+        - protocol: TCP
+          port: 5432

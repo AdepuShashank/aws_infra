@@ -95,7 +95,7 @@ output "ssm_parameter_paths" {
 }
 
 output "backup_bucket_names" {
-  description = "Backup buckets the node role may write. 70-backups must create exactly these two."
+  description = "Backup buckets the node role may write. 60-ops must create exactly these two."
   value = {
     etcd     = module.security.etcd_backup_bucket_name
     postgres = module.security.postgres_backup_bucket_name

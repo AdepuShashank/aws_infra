@@ -1,0 +1,48 @@
+# ---------------------------------------------------------------------------
+# The shared PostgreSQL: one cluster, ten databases.
+# ---------------------------------------------------------------------------
+# Ten projects each get a database on one Postgres instance, not ten instances. At
+# t4g.nano and this account's vCPU quota that is the only arithmetic that works, and
+# the projects are throwaway by definition - Infrastructure.MD puts deploying their
+# real code out of scope.
+#
+# One Application, not two. The namespace and the Cluster live in the same directory
+# and are ordered by argocd.argoproj.io/sync-wave annotations inside it, which is
+# what Argo CD uses for intra-Application ordering. Splitting them into two
+# Applications would work too, at the cost of a second Application object and a second
+# thing to go OutOfSync - and sync waves are exactly the mechanism for this.
+#
+# The directory is excluded from the root Application's recursive directory walk. See
+# the exclude glob in
+# infra/modules/platform-bootstrap/templates/bootstrap-platform.sh.tftpl: without it,
+# the root app applies these same objects into the argocd namespace while this
+# Application applies them into data, and self-heal fights prune over who owns them.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: shared-postgres
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+
+  source:
+    repoURL: https://github.com/AdepuShashank/aws_infra
+    targetRevision: main
+    path: gitops/prod/apps/shared-postgres
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: data
+
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      # No CreateNamespace. 00-namespace.yaml owns the Namespace so it can set the
+      # Pod Security Admission labels - CreateNamespace would create a bare one first
+      # and the enforcement would never be evaluated against anything.
+      - ServerSideApply=true
+      - RespectIgnoreDifferences=true

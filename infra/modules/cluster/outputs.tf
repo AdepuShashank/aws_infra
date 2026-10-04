@@ -79,7 +79,7 @@ output "ami_resolution_method" {
 }
 
 output "etcd_backup_bucket" {
-  description = "Bucket receiving etcd snapshots. Shared with 70-backups."
+  description = "Bucket receiving etcd snapshots. Shared with 60-ops."
   value       = aws_s3_bucket.etcd_backups.id
 }
 

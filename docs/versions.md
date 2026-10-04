@@ -37,7 +37,10 @@ only. Pinning 1.37 would run Calico untested. 1.36 also keeps kubeadm version sk
 | Calico (tigera-operator) | `v3.32.2` | github.com/projectcalico/calico releases; manifests under `manifests/` at that tag |
 | Traefik (Helm chart) | `41.4.0`, image `v3.6.2` | github.com/traefik/traefik-helm-chart releases |
 | Argo CD (app image) | `v3.5.3` (chart `10.9.6`) | github.com/argoproj/argo-cd releases |
-| CloudNativePG (operator chart) | `0.28.0` | https://cloudnative-pg.github.io/charts | cloudnative-pg.io — supports k8s 1.34–1.36 |
+| CloudNativePG (operator chart) | `0.29.1` (operator `1.30.1`) | cloudnative-pg.github.io/charts `index.yaml`, read 2026-10-04. Was `0.28.0`; that line's operator is out of support, and its successor's default database image is PostgreSQL 18, which `shared-postgres` deliberately does not take |
+| PostgreSQL (CNPG instance image) | `ghcr.io/cloudnative-pg/postgresql:17.6-system-trixie` | set explicitly in `gitops/<env>/apps/shared-postgres/`. The distro suffix is required — a bare `17.6` does not resolve to an image the operator accepts |
+| `amazon/aws-cli` (backup CronJob) | `2.37.9` | hub.docker.com/r/amazon/aws-cli/tags, read 2026-10-04. `<major.minor.patch>` tags are immutable; `latest` explicitly is not |
+| `postgres` (pg_dump client image) | `17.6-alpine` | matches the server major.minor, which `pg_dump` requires |
 | AWS EBS CSI driver (chart) | `2.64.0` (driver `v1.64.0`) | github.com/kubernetes-sigs/aws-ebs-csi-driver releases |
 | metrics-server (chart) | `3.14.0` (app `v0.9.0`) | github.com/kubernetes-sigs/metrics-server releases |
 | External Secrets Operator (chart) | `2.10.0` (app `v2.10.0`) | github.com/external-secrets/external-secrets releases |

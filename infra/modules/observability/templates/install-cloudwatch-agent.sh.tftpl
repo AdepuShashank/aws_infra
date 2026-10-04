@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+# Installs and configures the CloudWatch agent.
+#
+# Rendered from templates/install-cloudwatch-agent.sh.tftpl. A shell parameter
+# expansion in braces would be claimed by templatefile before bash saw it, so this
+# file uses $NAME for shell variables and initialises anything needing a default
+# separately.
+#
+# Re-running is safe, and deliberately a no-op once the installed configuration
+# already matches the rendered one: the association fires every six hours for the
+# lifetime of the cluster, and re-fetching a ~100 MB package over the NAT instance
+# every time is a cost nobody asked for.
+set -uo pipefail
+
+REGION=__REGION__
+ETC=/opt/aws/amazon-cloudwatch-agent/etc
+CFG="$ETC/amazon-cloudwatch-agent.json"
+APPLIED="$ETC/amazon-cloudwatch-agent.applied.json"
+BIN=/opt/aws/amazon-cloudwatch-agent/bin
+RENDERED=/tmp/cloudwatch-agent-desired.json
+
+# The .deb is published per architecture under /ubuntu/<arch>/latest/. Detecting
+# rather than hardcoding means the same document works on a t4g and on an x86 node
+# without a second template.
+case "$(uname -m)" in
+aarch64 | arm64) ARCH=arm64 ;;
+x86_64 | amd64) ARCH=amd64 ;;
+*)
+  echo "ERROR: unsupported architecture $(uname -m)" >&2
+  exit 1
+  ;;
+esac
+
+cat > "$RENDERED" <<'AGENTJSON'
+__AGENT_CONFIG__
+AGENTJSON
+
+# Already in the desired state. Compared against a marker written next to the live
+# config rather than against /tmp, because /tmp does not survive a reboot and the
+# node reboots far more often than this association changes.
+if [ -x "$BIN/amazon-cloudwatch-agent-ctl" ] && [ -f "$CFG" ] && [ -f "$APPLIED" ]; then
+  if diff -q "$APPLIED" "$RENDERED" >/dev/null 2>&1; then
+    echo "cloudwatch agent already installed and configured"
+    exit 0
+  fi
+  echo "agent configuration changed; reapplying"
+fi
+
+if [ ! -x "$BIN/amazon-cloudwatch-agent-ctl" ]; then
+  URL="https://amazoncloudwatch-agent.s3.amazonaws.com/ubuntu/$ARCH/latest/amazon-cloudwatch-agent.deb"
+  echo "installing cloudwatch agent from $URL"
+  curl -fsSL --retry 5 --retry-delay 5 "$URL" -o /tmp/cwa.deb || {
+    echo "ERROR: download failed" >&2
+    exit 1
+  }
+  # -E keeps any existing config file the package ships, which a reconfigure
+  # during a package upgrade would otherwise overwrite.
+  dpkg -i -E /tmp/cwa.deb || {
+    echo "ERROR: dpkg failed; run 'dpkg --configure -a' on the node to see why" >&2
+    exit 1
+  }
+  rm -f /tmp/cwa.deb
+fi
+
+mkdir -p "$ETC"
+install -m 0644 "$RENDERED" "$CFG"
+install -m 0644 "$RENDERED" "$APPLIED"
+
+"$BIN/amazon-cloudwatch-agent-ctl" fetch-config || {
+  echo "ERROR: fetch-config rejected the rendered config" >&2
+  exit 1
+}
+
+"$BIN/amazon-cloudwatch-agent-ctl" start || {
+  echo "ERROR: agent failed to start" >&2
+  exit 1
+}
+
+echo "cloudwatch agent installed, configured and started for region $REGION"

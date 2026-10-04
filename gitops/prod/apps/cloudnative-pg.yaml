@@ -1,12 +1,20 @@
 # ---------------------------------------------------------------------------
 # CloudNativePG operator
 # ---------------------------------------------------------------------------
-# The shared Postgres for all ten projects. The operator is installed here; the
-# Cluster itself is created by the ApplicationSet so that it is versioned in the
-# same repository as everything else rather than applied once from a laptop.
+# The operator that runs the shared Postgres. The Cluster itself is NOT created here
+# and NOT created by the ApplicationSet - it is in
+# gitops/prod/apps/shared-postgres/, owned by the shared-postgres Application. The
+# ApplicationSet in apps/ creates per-project namespaces and nothing else.
 #
 # Wave 5, after the platform is up: nothing depends on the operator existing, but
-# the project scaffolding does depend on the data namespace existing.
+# the shared-postgres Cluster does depend on the operator and on the EBS CSI driver
+# (wave 1) being present.
+#
+# Chart version: 0.29.1, which ships operator 1.30.1. Verified against
+# https://cloudnative-pg.github.io/charts/index.yaml rather than assumed - this file
+# previously pinned 0.28.0, whose operator (1.29.x) is out of support. Bumping the
+# operator while a Cluster exists is an in-place rolling upgrade of a single replica
+# and takes the database with it for a few seconds, so do it when nobody is using it.
 apiVersion: argoproj.io/v1alpha1
 kind: Application
 metadata:
@@ -20,7 +28,7 @@ spec:
   source:
     repoURL: https://cloudnative-pg.github.io/charts
     chart: cloudnative-pg
-    targetRevision: 0.28.0
+    targetRevision: 0.29.1
     helm:
       releaseName: cloudnative-pg
       values: |
