@@ -23,9 +23,20 @@ spec:
   project: default
 
   source:
-    repoURL: https://argoproj.github.io/argo-helm
+    # Traefik's own Helm repository, NOT argoproj.github.io/argo-helm.
+    #
+    # The argo-helm index was read on 2026-10-04 and its newest entry for a chart
+    # named traefik is 0.16.10, from 2021. Chart 41.x exists, but only in
+    # traefik.github.io - so pointing at argo-helm fails with:
+    #
+    #   chart "traefik" version "41.4.0" not found in
+    #   https://argoproj.github.io/argo-helm repository
+    #
+    # which reads like a bad version pin rather than a bad repository, and argo-helm
+    # is a plausible-looking default to reach for.
+    repoURL: https://traefik.github.io/charts
     chart: traefik
-    targetRevision: 41.4.0
+    targetRevision: 41.6.1
     helm:
       releaseName: traefik
       values: |
@@ -34,9 +45,14 @@ spec:
         fullnameOverride: traefik
 
         image:
-          # The chart's default tag tracks the chart release. Pinning it means a
-          # chart bump that silently changes the running image shows up in a diff.
-          tag: v3.6.2
+          # Matches chart 41.6.1's appVersion in the index on 2026-10-04.
+          #
+          # The previous pair here was chart 41.4.0 with image v3.6.2, and 41.4.0
+          # ships v3.7.12 - so the override was pinning Traefik three minor versions
+          # behind the chart whose values it was being handed. Pinning the pair
+          # together is the point; a pin that disagrees with the chart is worse than
+          # no pin, because it looks deliberate.
+          tag: v3.7.13
 
         service:
           type: NodePort

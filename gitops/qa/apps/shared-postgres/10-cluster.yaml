@@ -35,7 +35,7 @@ spec:
   # anti-affinity rule with no second eligible node leaves the pod Pending forever -
   # which is the failure that makes an availability requirement worse than none.
   storage:
-    # ebs-sc, not a StorageClass named here: gitops/prod/apps/ebs-csi.yaml owns it,
+    # ebs-sc, not a StorageClass named here: gitops/qa/apps/ebs-csi.yaml owns it,
     # and it is already gp3 with encrypted: "true" and the account's EBS KMS key.
     # Naming it here would be a second definition of the same thing.
     size: 1Gi

@@ -14,9 +14,22 @@ spec:
   project: default
 
   source:
-    repoURL: https://github.com/kubernetes-sigs/metrics-server
-    targetRevision: v3.14.0
-    path: components/metrics-server
+    # The published Helm repository, not the git repository with a path into it.
+    #
+    # metrics-server's git tags are the OPERATOR's tags (v0.7.x, v0.8.x), and the Helm
+    # chart's versions are an independent 3.x series. So `targetRevision: v3.14.0`
+    # against github.com/kubernetes-sigs/metrics-server is a ref that has never
+    # existed, and Argo CD says so:
+    #
+    #   unable to resolve 'v3.14.0' to a commit SHA
+    #
+    # which is a clearer error than it deserves. Chart 3.14.0 does exist, in
+    # kubernetes-sigs.github.io/metrics-server, whose appVersion 0.9.0 is the operator
+    # release the chart wraps. Reading the index on 2026-10-04: chart 3.14.0 = app
+    # v0.9.0, which is the pair that was already intended here.
+    repoURL: https://kubernetes-sigs.github.io/metrics-server
+    chart: metrics-server
+    targetRevision: 3.14.0
     helm:
       releaseName: metrics-server
       values: |

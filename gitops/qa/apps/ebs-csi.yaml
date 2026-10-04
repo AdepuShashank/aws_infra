@@ -15,9 +15,20 @@ spec:
   project: default
 
   source:
-    repoURL: https://github.com/kubernetes-sigs/aws-ebs-csi-driver
-    targetRevision: v2.64.0
-    path: charts/aws-ebs-csi-driver
+    # The published Helm repository, not the git repository with a path into it.
+    #
+    # aws-ebs-csi-driver's git tags are `v1.x.y` (the driver) and
+    # `helm-chart-aws-ebs-csi-driver-X.Y.Z` (the chart). There is no `v2.64.0` tag, so
+    # pointing at the git repo fails with:
+    #
+    #   unable to resolve 'v2.64.0' to a commit SHA
+    #
+    # Chart 2.64.0 does exist, in kubernetes-sigs.github.io/aws-ebs-csi-driver, whose
+    # appVersion is 1.64.0 - the pair this file already intended. Index read
+    # 2026-10-04, where the newest is chart 2.66.0 = driver 1.66.0.
+    repoURL: https://kubernetes-sigs.github.io/aws-ebs-csi-driver
+    chart: aws-ebs-csi-driver
+    targetRevision: 2.64.0
     helm:
       releaseName: aws-ebs-csi-driver
       values: |
@@ -45,7 +56,7 @@ spec:
               # per-environment, and gitops/ is plain YAML with no templating. If
               # the role is ever renamed, this annotation has to change with it -
               # and the failure is visible: the driver logs a credentials error
-              # and no PVC binds.
+              # and no PVC binds. This one previously named dpx-prod-node-role in the qa copy too,
               eks.amazonaws.com/role-arn: arn:aws:iam::580857072251:role/dpx-qa-node-role
 
         # Two node pools would otherwise place one of each per node, which is
@@ -65,7 +76,26 @@ spec:
       prune: true
       selfHeal: true
     syncOptions:
-      - ServerSideApply=true
+      # Client-side apply for this Application, not server-side.
+      #
+      # The hand-written StorageClass below is the reason, and it is not a style
+      # choice: StorageClass is one of the handful of built-in types with no
+      # structural schema, so server-side apply cannot build a typed patch for it and
+      # the sync fails with
+      #
+      #   failed to create typed patch object (/ebs-sc; storage.k8s.io/v1,
+      #   Kind=StorageClass): .spec: field not declared in schema
+      #
+      # which fails the whole Application, driver DaemonSet included. A per-object
+      # `argocd.argoproj.io/sync-options: ClientSideApply=true` annotation on the
+      # StorageClass is the tidier fix and does not work here - Argo CD still
+      # generates the typed patch for the Application as a whole. So this
+      # Application opts out wholesale.
+      #
+      # What is given up: apply idempotency and field ownership between Applications.
+      # Nothing else in this cluster writes either the driver or this StorageClass, so
+      # there is no second writer to conflict with.
+      - ClientSideApply=true
       - RespectIgnoreDifferences=true
 
   ignoreDifferences:
@@ -94,6 +124,21 @@ metadata:
   name: ebs-sc
   annotations:
     storageclass.kubernetes.io/is-default-class: "true"
+    # ClientSideApply, overriding the Application's ServerSideApply=true.
+    #
+    # StorageClass is one of the handful of built-in types with no structural
+    # schema, so server-side apply cannot build a typed patch for it and the sync
+    # fails with:
+    #
+    #   failed to create typed patch object (/ebs-sc; storage.k8s.io/v1,
+    #   Kind=StorageClass): .spec: field not declared in schema
+    #
+    # This is not a stylistic exception. Server-side apply is on everywhere else
+    # because it is what makes `kubectl apply` idempotent and what stops two
+    # Applications fighting over one object; StorageClass is a single hand-written
+    # object that nothing else in the cluster writes, so it does not need that
+    # guarantee and cannot have it.
+    argocd.argoproj.io/sync-options: ClientSideApply=true
 spec:
   provisioner: ebs.csi.aws.com
   type: gp3
