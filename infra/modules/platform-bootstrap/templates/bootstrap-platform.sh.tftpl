@@ -404,11 +404,45 @@ fi
 # public https endpoint and failing on a private repo. GITHUB_SSH_HOST is supplied
 # by the caller because the ssh:// form needs a host prefix that differs between
 # github.com and a self-hosted Git server.
+#
+# The public branch is where the bug lived, and it is worth spelling out because the
+# symptom points somewhere else entirely.
+#
+# gitops_repo_url arrives as bare `owner/repo` - no scheme, no host - and this used to
+# assign that straight to repoURL on the public path. Argo CD then hands it to git as
+# a repository location, git cannot work out what protocol or host it means, and the
+# error comes back as:
+#
+#   Failed to load target state: failed to generate manifest for source 1 of 1:
+#   rpc error: code = Unknown desc = failed to list refs: repository not found
+#
+# "repository not found" reads unambiguously like a permissions problem, and on this
+# project it was believed to be one for a full day - the repository was ALSO private,
+# so the two causes were indistinguishable from the outside. Making the repository
+# public did not fix it, because the URL was still malformed. Diagnosing this needed
+# `kubectl get application root -o jsonpath='{.spec.source.repoURL}'`, which is why it
+# is worth printing the URL at the end rather than only the path.
+#
+# The https:// form is built here rather than taken from a variable because the host
+# is part of what makes the URL valid, and gitops_ssh_host is the only host this module
+# is told about.
 if [ "$REPO_IS_PRIVATE" = "true" ]; then
   EFFECTIVE_REPO_URL="ssh://git@$${GITHUB_SSH_HOST}/$${GITOPS_REPO_URL}"
 else
-  EFFECTIVE_REPO_URL="$GITOPS_REPO_URL"
+  EFFECTIVE_REPO_URL="https://$${GITHUB_SSH_HOST}/$${GITOPS_REPO_URL}"
 fi
+
+case "$EFFECTIVE_REPO_URL" in
+  https://* | http://* | ssh://* | git://*)
+    log "repository URL: $EFFECTIVE_REPO_URL"
+    ;;
+  *)
+    log "ERROR: built a repository URL with no scheme: $EFFECTIVE_REPO_URL"
+    log "       Argo CD will report this as 'repository not found', which looks like"
+    log "       a permissions problem and is not one."
+    exit 1
+    ;;
+esac
 
 log "creating the root Application pointing at $EFFECTIVE_REPO_URL:$GITOPS_REPO_PATH"
 # The exclude glob is load-bearing, and the reason is specific to this layout.

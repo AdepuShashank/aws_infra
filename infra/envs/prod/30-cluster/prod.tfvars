@@ -3,7 +3,7 @@
 # Applied with:
 #   terraform plan -input=false "-var-file=..\common.tfvars" "-var-file=prod.tfvars"
 
-compute_enabled = false
+compute_enabled = true
 
 # AMI resolution. Canonical has not published
 # /aws/service/canonical/ubuntu/server/24.04/.../arm64/... in ap-south-1, so the
